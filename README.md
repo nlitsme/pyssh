@@ -5,6 +5,10 @@ helpers are included under their normal import names. Cryptographic primitives
 come from `cryptography`; SSH negotiation, framing, key derivation,
 authentication, channels, and connection state are implemented here.
 
+The purpose of this python implementation is to get a overview of all messages
+and operations involved in the ssh protocol.
+
+
 ## Requirements
 
 Linux/POSIX, Python 3.10 or newer, and `cryptography` 47 or newer with an
