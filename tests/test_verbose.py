@@ -5,6 +5,7 @@ import io
 import socket
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
@@ -12,6 +13,11 @@ import ssh
 
 
 class ProtocolTraceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        clock = patch("ssh.ProtocolTrace.timestamp", return_value="12:34:56.123456")
+        clock.start()
+        self.addCleanup(clock.stop)
+
     def test_verbose_argument_count(self) -> None:
         parser = ssh.build_parser()
         for flag, expected in (([], 0), (["-v"], 1), (["-vv"], 2), (["--verbose", "--verbose"], 2)):
@@ -25,7 +31,7 @@ class ProtocolTraceTests(unittest.TestCase):
         packet = ssh.Msg94_ChannelData(7, bytes(range(256)) * 32)
         payload = ssh.encode_message(packet)
         ssh.ProtocolTrace(1, output).message("send", packet, payload)
-        self.assertEqual(output.getvalue(), f"send SSH_MSG_CHANNEL_DATA {payload.hex()}\n")
+        self.assertEqual(output.getvalue(), f"12:34:56.123456 send SSH_MSG_CHANNEL_DATA {payload.hex()}\n")
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertGreater(len(output.getvalue()), 160)
 
@@ -72,10 +78,10 @@ class ProtocolTraceTests(unittest.TestCase):
             trace.message("send", packet, ssh.encode_message(packet))
         trace.identification("recv", ssh.Hello())
         lines = output.getvalue().splitlines()
-        self.assertEqual(lines[0], "send SSH_MSG_NEWKEYS 15")
-        self.assertTrue(lines[1].startswith("send SSH_MSG_UNKNOWN_254 fe"))
-        self.assertTrue(lines[2].startswith("send SSH_MSG_KEX_HYBRID_INIT 1e"))
-        self.assertEqual(lines[3], f"recv SSH_IDENTIFICATION {ssh.encode_object(ssh.Hello()).hex()}")
+        self.assertEqual(lines[0], "12:34:56.123456 send SSH_MSG_NEWKEYS 15")
+        self.assertTrue(lines[1].startswith("12:34:56.123456 send SSH_MSG_UNKNOWN_254 fe"))
+        self.assertTrue(lines[2].startswith("12:34:56.123456 send SSH_MSG_KEX_HYBRID_INIT 1e"))
+        self.assertEqual(lines[3], f"12:34:56.123456 recv SSH_IDENTIFICATION {ssh.encode_object(ssh.Hello()).hex()}")
 
     def test_live_client_and_server_trace_encrypted_messages(self) -> None:
         for level in (1, 2):
@@ -106,13 +112,13 @@ class ProtocolTraceTests(unittest.TestCase):
             sent: list[bytes] = []
             received: list[bytes] = []
             for line in client_log.getvalue().splitlines():
-                direction, name, data = line.split(" ", 2)
+                timestamp, direction, name, data = line.split(" ", 3)
                 if name.startswith("SSH_MSG_"):
                     (sent if direction == "send" else received).append(bytes.fromhex(data))
             peer_sent: list[bytes] = []
             peer_received: list[bytes] = []
             for line in server_log.getvalue().splitlines():
-                direction, name, data = line.split(" ", 2)
+                timestamp, direction, name, data = line.split(" ", 3)
                 if name.startswith("SSH_MSG_"):
                     (peer_sent if direction == "send" else peer_received).append(bytes.fromhex(data))
             self.assertEqual(sent, peer_received)

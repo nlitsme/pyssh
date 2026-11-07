@@ -25,12 +25,13 @@ import time
 import warnings
 from collections import deque
 from dataclasses import dataclass, field, fields, is_dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import IO, BinaryIO, ClassVar, Iterator, TextIO, TypeVar
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519, mlkem, x25519
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, mlkem, x25519
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 from cryptography.hazmat.primitives.poly1305 import Poly1305
 
@@ -82,6 +83,17 @@ class SSHReader(DataReader):
     def readlstr(self, encoding: str = "utf-8") -> str:
         return self.readldata().decode(encoding)
 
+    def readmpint(self) -> int:
+        data = self.readldata()
+        if data == b"\x00":
+            raise ProtocolError("mpint zero must have zero length")
+        if len(data) > 1:
+            if data[0] == 0 and not data[1] & 0x80:
+                raise ProtocolError("redundant positive mpint sign byte")
+            if data[0] == 0xFF and data[1] & 0x80:
+                raise ProtocolError("redundant negative mpint sign byte")
+        return int.from_bytes(data, "big", signed=True)
+
     def readboolean(self) -> bool:
         value = self.readbyte()
         if value not in (0, 1):
@@ -107,6 +119,16 @@ class SSHWriter(DataWriter):
 
     def writelstr(self, text: str, encoding: str = "utf-8") -> None:
         self.writeldata(text.encode(encoding))
+
+    def writempint(self, value: int) -> None:
+        if value == 0:
+            self.writeldata(b"")
+            return
+        length = (value.bit_length() + 8) // 8
+        data = value.to_bytes(length, "big", signed=True)
+        while len(data) > 1 and ((data[0] == 0 and not data[1] & 0x80) or (data[0] == 0xFF and data[1] & 0x80)):
+            data = data[1:]
+        self.writeldata(data)
 
     def writeboolean(self, value: bool) -> None:
         self.writebyte(int(value))
@@ -638,24 +660,169 @@ class Msg60_UserAuthPKOK(SshPacket):
         self.public_key = reader.readldata()
 
 
+class PublicKeyFields(WireObject):
+    """Public key parameters; decoding support does not enable authentication."""
+
+
+@dataclass
+class RSAPublicKeyFields(PublicKeyFields):
+    exponent: int = 0
+    modulus: int = 0
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writempint(self.exponent)
+        writer.writempint(self.modulus)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.exponent = reader.readmpint()
+        self.modulus = reader.readmpint()
+        if self.exponent <= 0 or self.modulus <= 0:
+            raise ProtocolError("RSA public parameters must be positive")
+
+
+@dataclass
+class ECDSAPublicKeyFields(PublicKeyFields):
+    curve: str = "nistp256"
+    point: bytes = b""
+    curves: ClassVar[dict[str, type[ec.EllipticCurve]]] = {"nistp256": ec.SECP256R1, "nistp384": ec.SECP384R1, "nistp521": ec.SECP521R1}
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.curve, "ascii")
+        writer.writeldata(self.point)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.curve = reader.readlstr("ascii")
+        self.point = reader.readldata()
+        self.public_numbers()  # Validate the named curve and SEC1 point encoding.
+
+    def public_numbers(self) -> ec.EllipticCurvePublicNumbers:
+        if self.curve not in self.curves:
+            raise ProtocolError(f"unsupported ECDSA named curve: {self.curve}")
+        try:
+            key = ec.EllipticCurvePublicKey.from_encoded_point(self.curves[self.curve](), self.point)
+        except ValueError as exc:
+            raise ProtocolError("invalid ECDSA public point") from exc
+        return key.public_numbers()
+
+
+@dataclass
+class Ed25519PublicKeyFields(PublicKeyFields):
+    key: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writeldata(self.key)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.key = reader.readldata()
+        if len(self.key) != 32:
+            raise ProtocolError("Ed25519 public key must have 32 bytes")
+
+
+@dataclass
+class OpaquePublicKeyFields(PublicKeyFields):
+    """Unrecognized algorithm/certificate parameters, retained byte-for-byte."""
+
+    undecoded: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write(self.undecoded)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.undecoded = reader.read(reader.remaining())
+
+
+@dataclass
+class AdvertisedHostKey(WireObject):
+    algorithm: str = ""
+    parameters: PublicKeyFields = field(default_factory=OpaquePublicKeyFields)
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.algorithm, "ascii")
+        self.parameters.encode(writer)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.algorithm = reader.readlstr("ascii")
+        if self.algorithm == "ssh-rsa":
+            self.parameters = RSAPublicKeyFields()
+        elif self.algorithm in ("ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"):
+            self.parameters = ECDSAPublicKeyFields()
+        elif self.algorithm == "ssh-ed25519":
+            self.parameters = Ed25519PublicKeyFields()
+        else:
+            self.parameters = OpaquePublicKeyFields()
+        self.parameters.decode(reader)
+        if isinstance(self.parameters, ECDSAPublicKeyFields) and self.algorithm != "ecdsa-sha2-" + self.parameters.curve:
+            raise ProtocolError("ECDSA key algorithm and named curve do not match")
+
+    def fingerprint(self) -> str:
+        digest = hashlib.sha256(encode_object(self)).digest()
+        return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+    def bits(self) -> int | None:
+        if isinstance(self.parameters, RSAPublicKeyFields):
+            return self.parameters.modulus.bit_length()
+        if isinstance(self.parameters, ECDSAPublicKeyFields):
+            return self.parameters.curves[self.parameters.curve]().key_size
+        if isinstance(self.parameters, Ed25519PublicKeyFields):
+            return 256
+        return None
+
+
+class GlobalRequestData(WireObject):
+    """Fields following the global-request name and want-reply flag."""
+
+
+@dataclass
+class HostKeysRequestData(GlobalRequestData):
+    """A sequence of SSH strings extending to the end of the request; no count."""
+
+    keys: tuple[AdvertisedHostKey, ...] = ()
+
+    def encode(self, writer: SSHWriter) -> None:
+        for key in self.keys:
+            writer.writeldata(encode_object(key))
+
+    def decode(self, reader: SSHReader) -> None:
+        keys: list[AdvertisedHostKey] = []
+        while reader.remaining():
+            keys.append(decode_object(AdvertisedHostKey(), reader.readldata()))
+        self.keys = tuple(keys)
+
+
+@dataclass
+class OpaqueGlobalRequestData(GlobalRequestData):
+    """Unsupported request-specific payload, explicitly retained as undecoded."""
+
+    undecoded: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write(self.undecoded)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.undecoded = reader.read(reader.remaining())
+
+
 @dataclass
 class Msg80_GlobalRequest(SshPacket):
-    """The request-specific payload is unsupported and remains opaque."""
-
     msgtype: ClassVar[int] = 80
     name: str = ""
     want_reply: bool = False
-    data: bytes = b""
+    data: GlobalRequestData | bytes = field(default_factory=OpaqueGlobalRequestData)
+    hostkey_requests: ClassVar[tuple[str, ...]] = ("hostkeys-00@openssh.com", "hostkeys-prove-00@openssh.com")
 
     def encode(self, writer: SSHWriter) -> None:
         writer.writelstr(self.name)
         writer.writeboolean(self.want_reply)
-        writer.write(self.data)
+        if isinstance(self.data, bytes):
+            writer.write(self.data)  # Compatibility for callers supplying an encoded body.
+        else:
+            self.data.encode(writer)
 
     def decode(self, reader: SSHReader) -> None:
         self.name = reader.readlstr()
         self.want_reply = reader.readboolean()
-        self.data = reader.read(reader.remaining())
+        self.data = HostKeysRequestData() if self.name in self.hostkey_requests else OpaqueGlobalRequestData()
+        self.data.decode(reader)
 
 
 @dataclass
@@ -1253,15 +1420,27 @@ class ProtocolTrace:
         detail = data.hex() if self.verbose == 1 else repr(data.decode("utf-8", errors="backslashreplace"))
         self._write(f"{direction} {name} {detail}\n")
 
+    @staticmethod
+    def timestamp() -> str:
+        return datetime.now().strftime("%H:%M:%S.%f")
+
     def _write(self, text: str) -> None:
         with self.lock:
-            self.stream.write(text)
+            self.stream.write(f"{self.timestamp()} {text}")
             self.stream.flush()
 
     def _fields(self, value: WireObject, indent: str) -> Iterator[str]:
         if not is_dataclass(value):
             yield f"{indent}(empty body)"
             return
+        if isinstance(value, AdvertisedHostKey):
+            yield f"{indent}fingerprint: {value.fingerprint()}"
+            if value.bits() is not None:
+                yield f"{indent}bits: {value.bits()}"
+        if isinstance(value, ECDSAPublicKeyFields):
+            numbers = value.public_numbers()
+            yield from self._field("x", numbers.x, indent)
+            yield from self._field("y", numbers.y, indent)
         for item in fields(value):
             field_value: object = getattr(value, item.name)
             if isinstance(value, Msg20_KexInit) and item.name in value.list_fields:
@@ -1281,6 +1460,14 @@ class ProtocolTrace:
                 kind += f" ({value.name})"
             yield f"{indent}{name}: {kind}"
             yield from self._fields(value, indent + "  ")
+        elif isinstance(value, tuple):
+            yield f"{indent}{name}: {len(value)} entries"
+            for index, entry in enumerate(value):
+                yield from self._field(f"[{index}]", entry, indent + "  ")
+        elif isinstance(value, int) and value >= 2**64:
+            yield f"{indent}{name}: integer ({value.bit_length()} bits)"
+            data = value.to_bytes((value.bit_length() + 7) // 8, "big")
+            yield from self._bytes(data, indent + "  ")
         elif isinstance(value, bytes):
             yield f"{indent}{name}: {len(value)} bytes"
             yield from self._bytes(value, indent + "  ")
@@ -1826,7 +2013,9 @@ def finish_client_auth(connection: Connection) -> None:
 def handle_global(connection: Connection, packet: SshPacket) -> bool:
     if not isinstance(packet, Msg80_GlobalRequest):
         return False
-    # The unsupported request-specific fields remain in packet.data.
+    # Advertisements are decoded for inspection; they do not update trust or
+    # enable automatic key rotation. Unimplemented requests still fail when
+    # the peer asks for a reply; unknown bodies remain explicitly opaque.
     if packet.want_reply:
         connection.send(Msg82_RequestFailure())
     return True

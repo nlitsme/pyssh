@@ -73,7 +73,8 @@ reader.finish()
 
 `SSHReader` and `SSHWriter` extend your `DataReader`/`DataWriter` classes.
 They retain `read32be`/`write32be` and add `readldata`/`writeldata`,
-`readlstr`/`writelstr`, and `readboolean`/`writeboolean`. SSH strings retain
+`readlstr`/`writelstr`, `readboolean`/`writeboolean`, and
+`readmpint`/`writempint`. SSH strings retain
 NULs; malformed text is rejected rather than silently discarded.
 
 `encode_message` writes the message-type byte followed by `packet.encode`.
@@ -91,6 +92,14 @@ fields live in `ShellRequest`, `ExecRequest`, `SignalRequest`,
 All use the same instance encode/decode interface. Unknown messages retain
 their complete body in `RawPacket`; unsupported method/request payloads remain
 explicitly opaque. `EncryptedData` denotes undecoded ciphertext.
+
+Global requests use `HostKeysRequestData` for OpenSSH's
+`hostkeys-00@openssh.com` and `hostkeys-prove-00@openssh.com` key lists;
+other bodies use `OpaqueGlobalRequestData`. Each `AdvertisedHostKey`
+decodes RSA, ECDSA, or Ed25519 parameters. Unknown key types retain their
+remaining bytes in `OpaquePublicKeyFields.undecoded`. This decodes the
+advertisements; it does not implement automatic host-key learning or proof
+responses, or change the algorithms accepted for authentication.
 
 `HostKey`, `Signature`, `Hello`, `HybridInit`, and `HybridReply` also use this
 interface. Message types 30/31 have the same outer format for Curve25519 and
@@ -174,7 +183,7 @@ python ssh.py server -v -k host_ed25519 -u testuser
 For example:
 
 ```text
-send SSH_MSG_SERVICE_REQUEST 050000000c7373682d7573657261757468
+20:12:34.123456 send SSH_MSG_SERVICE_REQUEST 050000000c7373682d7573657261757468
 ```
 
 The hex is the message-type byte followed by the entire body. It is not
@@ -183,11 +192,13 @@ authentication tags. Outgoing messages are logged before encryption;
 incoming messages after decryption, integrity verification, and decoding.
 Identification/pre-banner lines are also logged, with their complete bytes.
 Direction is relative to the endpoint producing the log.
+Every record starts with local time in `HH:MM:SS.uuuuuu` format, including
+identification records. The six fractional digits represent microseconds.
 
 Use `-vv` (or repeat `--verbose`) for the decoded representation instead:
 
 ```text
-send SSH_MSG_SERVICE_REQUEST (type=5, 17 bytes)
+20:12:34.123456 send SSH_MSG_SERVICE_REQUEST (type=5, 17 bytes)
   service: 'ssh-userauth'
 ```
 
@@ -196,6 +207,10 @@ lists are shown one entry per line; binary values include lengths and full
 offset-labelled hex dumps, plus text where readable. Control characters in
 text are escaped. Hybrid key-exchange messages are named according to the
 negotiated algorithm. `-vvv` and higher use the same decoded format as `-vv`.
+The timestamp appears once on the message header; decoded fields remain
+grouped underneath. Host-key advertisements include SHA-256 fingerprints,
+key sizes, RSA exponents and moduli, ECDSA curves and point coordinates,
+and Ed25519 public bytes. Unknown parameters remain explicitly undecoded.
 
 Tracing goes to stderr, leaving command stdout unchanged. This is a full
 plaintext trace: passwords and channel contents are included. The default
@@ -238,7 +253,11 @@ python -m unittest discover -s tests -v
 python -m unittest datareader datawriter -v
 ```
 
-Validated here: **41 SSH tests plus 18 original helper tests**, all passing.
+The additional host-key capture tests check all three advertised keys,
+exact round trips, malformed inputs, and fingerprints against `ssh-keygen`.
+Trace tests cover microsecond timestamp formatting at both verbosity levels.
+
+Validated here: **49 SSH tests plus 18 original helper tests**, all passing.
 OpenSSH 10.0p2 independently verified both endpoints with both KEX methods;
 rekeys during live transfers and after authentication were also tested.
 OpenSSH-specific tests skip only when the relevant executable is absent.
