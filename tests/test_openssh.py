@@ -77,6 +77,18 @@ class OpenSSHTests(unittest.TestCase):
                 self.assertEqual(client.run("cat; printf error >&2; exit 4", b"client data"), ssh.CommandResult(b"client data", b"error", 4))
 
     @unittest.skipUnless(shutil.which("sshd"), "OpenSSH server unavailable")
+    def test_python_pty_client_to_openssh_server(self) -> None:
+        try:
+            with self.openssh_server(False) as client:
+                result = client.run("test -t 0 && stty size; exit 5", terminal=ssh.PtyRequest(b"xterm-kitty", 132, 43))
+                self.assertEqual(result.exit_status, 5)
+                self.assertIn(b"43 132\r\n", result.stdout)
+        except AssertionError as exc:
+            if "chown(/dev/pts/" in str(exc) and "failed: Invalid argument" in str(exc):
+                self.skipTest("unprivileged OpenSSH cannot chown PTYs in this container")
+            raise
+
+    @unittest.skipUnless(shutil.which("sshd"), "OpenSSH server unavailable")
     def test_openssh_initiated_rekey_with_live_data(self) -> None:
         for curve in (False, True):
             with self.subTest(curve=curve), self.openssh_server(curve, rekey=True) as client:

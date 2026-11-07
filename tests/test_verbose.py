@@ -52,9 +52,8 @@ class ProtocolTraceTests(unittest.TestCase):
         self.assertIn("recv SSH_MSG_USERAUTH_REQUEST", text)
         self.assertIn("username: 'itsme'", text)
         self.assertIn("method: PasswordAuth (password)", text)
-        self.assertIn("password: 6 bytes", text)
-        self.assertIn("text: 'secret'", text)
-        self.assertIn("73 65 63 72 65 74", text)
+        self.assertIn("password: 'secret'", text)
+        self.assertNotIn("text:", text)
 
     def test_algorithm_lists_are_readable_and_control_characters_escaped(self) -> None:
         output = io.StringIO()
@@ -126,7 +125,7 @@ class ProtocolTraceTests(unittest.TestCase):
         else:
             self.assertIn("request: ExecRequest (exec)", server_log.getvalue())
             self.assertIn("command: 'cat; exit 7'", server_log.getvalue())
-            self.assertIn("text: 'trace-input'", client_log.getvalue())
+            self.assertIn("data: 'trace-input'", client_log.getvalue())
 
 
 if __name__ == "__main__":

@@ -3,27 +3,35 @@
 
 Suite: ML-KEM-768/X25519 (or Curve25519), Ed25519, OpenSSH ChaCha20/
 Poly1305, no compression. Authentication: password and Ed25519 user key.
-One session per connection.
+One shell, exec, PTY, or SFTP session per connection.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import errno
+import fcntl
 import getpass
 import hashlib
 import hmac
 import io
 import os
+import pty
 import select
+import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
+import tty
 import warnings
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -1171,6 +1179,39 @@ class EnvRequest(RequestBody):
         self.value = reader.readldata()
 
 
+@dataclass
+class SubsystemRequest(RequestBody):
+    name: ClassVar[str] = "subsystem"
+    subsystem: str = ""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.subsystem)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.subsystem = reader.readlstr()
+
+
+@dataclass
+class WindowChangeRequest(RequestBody):
+    name: ClassVar[str] = "window-change"
+    columns: int = 0
+    rows: int = 0
+    width_pixels: int = 0
+    height_pixels: int = 0
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.columns)
+        writer.write32be(self.rows)
+        writer.write32be(self.width_pixels)
+        writer.write32be(self.height_pixels)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.columns = reader.read32be()
+        self.rows = reader.read32be()
+        self.width_pixels = reader.read32be()
+        self.height_pixels = reader.read32be()
+
+
 class ShellRequest(RequestBody):
     name = "shell"
 
@@ -1272,6 +1313,8 @@ class Msg98_ChannelRequest(ChannelMessage):
         requests: dict[str, type[RequestBody]] = {
             "pty-req": PtyRequest,
             "env": EnvRequest,
+            "subsystem": SubsystemRequest,
+            "window-change": WindowChangeRequest,
             "shell": ShellRequest,
             "exec": ExecRequest,
             "signal": SignalRequest,
@@ -1565,6 +1608,543 @@ MESSAGE_NAMES: dict[int, str] = {
 }
 
 
+@dataclass
+class SftpExtension(WireObject):
+    name: bytes = b""
+    data: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writeldata(self.name)
+        writer.writeldata(self.data)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.name = reader.readldata()
+        self.data = reader.readldata()
+
+
+@dataclass
+class SftpAttributes(WireObject):
+    flags: int = 0
+    size: int | None = None
+    uid: int | None = None
+    gid: int | None = None
+    permissions: int | None = None
+    atime: int | None = None
+    mtime: int | None = None
+    extensions: tuple[SftpExtension, ...] = ()
+    flag_fields: ClassVar[tuple[tuple[int, str, bool], ...]] = (
+        (1, "size", True),
+        (2, "uid", False),
+        (2, "gid", False),
+        (4, "permissions", False),
+        (8, "atime", False),
+        (8, "mtime", False),
+    )
+
+    def encode(self, writer: SSHWriter) -> None:
+        if self.flags & ~0x8000000F:
+            raise ProtocolError("unknown SFTP attribute flags")
+        writer.write32be(self.flags)
+        for flag, name, wide in self.flag_fields:
+            if self.flags & flag:
+                value: int | None = getattr(self, name)
+                if value is None:
+                    raise ProtocolError(f"SFTP attributes missing {name}")
+                if wide:
+                    writer.write64be(value)
+                else:
+                    writer.write32be(value)
+        if self.flags & 0x80000000:
+            writer.write32be(len(self.extensions))
+            for extension in self.extensions:
+                extension.encode(writer)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.flags = reader.read32be()
+        if self.flags & ~0x8000000F:
+            raise ProtocolError("unknown SFTP attribute flags; layout undecoded")
+        for flag, name, wide in self.flag_fields:
+            value = (reader.read64be() if wide else reader.read32be()) if self.flags & flag else None
+            setattr(self, name, value)
+        self.extensions = ()
+        if self.flags & 0x80000000:
+            count = reader.read32be()
+            if count > reader.remaining() // 8:
+                raise ProtocolError("truncated SFTP attribute extensions")
+            self.extensions = tuple(self._extension(reader) for _ in range(count))
+
+    @staticmethod
+    def _extension(reader: SSHReader) -> SftpExtension:
+        result = SftpExtension()
+        result.decode(reader)
+        return result
+
+
+class SftpPacket(WireObject):
+    @property
+    def msgtype(self) -> int:
+        raise NotImplementedError
+
+    @property
+    def name(self) -> str:
+        return "SSH_FXP_" + type(self).__name__.split("_", 1)[1].upper()
+
+
+@dataclass
+class SftpVersionPacket(SftpPacket):
+    version: int = 3
+    extensions: tuple[SftpExtension, ...] = ()
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.version)
+        for extension in self.extensions:
+            extension.encode(writer)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.version = reader.read32be()
+        extensions: list[SftpExtension] = []
+        while reader.remaining():
+            extension = SftpExtension()
+            extension.decode(reader)
+            extensions.append(extension)
+        self.extensions = tuple(extensions)
+
+
+class Sftp1_Init(SftpVersionPacket):
+    msgtype: ClassVar[int] = 1
+
+
+class Sftp2_Version(SftpVersionPacket):
+    msgtype: ClassVar[int] = 2
+
+
+@dataclass
+class SftpPathPacket(SftpPacket):
+    request_id: int = 0
+    path: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.request_id)
+        writer.writeldata(self.path)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.request_id = reader.read32be()
+        self.path = reader.readldata()
+
+
+@dataclass
+class Sftp3_Open(SftpPathPacket):
+    msgtype: ClassVar[int] = 3
+    pflags: int = 0
+    attributes: SftpAttributes = field(default_factory=SftpAttributes)
+
+    def encode(self, writer: SSHWriter) -> None:
+        super().encode(writer)
+        writer.write32be(self.pflags)
+        self.attributes.encode(writer)
+
+    def decode(self, reader: SSHReader) -> None:
+        super().decode(reader)
+        self.pflags = reader.read32be()
+        self.attributes.decode(reader)
+
+
+@dataclass
+class SftpHandlePacket(SftpPacket):
+    request_id: int = 0
+    handle: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.request_id)
+        writer.writeldata(self.handle)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.request_id = reader.read32be()
+        self.handle = reader.readldata()
+
+
+class Sftp4_Close(SftpHandlePacket):
+    msgtype: ClassVar[int] = 4
+
+
+@dataclass
+class Sftp5_Read(SftpHandlePacket):
+    msgtype: ClassVar[int] = 5
+    offset: int = 0
+    length: int = 0
+
+    def encode(self, writer: SSHWriter) -> None:
+        super().encode(writer)
+        writer.write64be(self.offset)
+        writer.write32be(self.length)
+
+    def decode(self, reader: SSHReader) -> None:
+        super().decode(reader)
+        self.offset = reader.read64be()
+        self.length = reader.read32be()
+
+
+@dataclass
+class Sftp6_Write(SftpHandlePacket):
+    msgtype: ClassVar[int] = 6
+    offset: int = 0
+    data: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        super().encode(writer)
+        writer.write64be(self.offset)
+        writer.writeldata(self.data)
+
+    def decode(self, reader: SSHReader) -> None:
+        super().decode(reader)
+        self.offset = reader.read64be()
+        self.data = reader.readldata()
+
+
+class Sftp7_Lstat(SftpPathPacket):
+    msgtype: ClassVar[int] = 7
+
+
+class Sftp8_Fstat(SftpHandlePacket):
+    msgtype: ClassVar[int] = 8
+
+
+@dataclass
+class SftpPathAttributesPacket(SftpPathPacket):
+    attributes: SftpAttributes = field(default_factory=SftpAttributes)
+
+    def encode(self, writer: SSHWriter) -> None:
+        super().encode(writer)
+        self.attributes.encode(writer)
+
+    def decode(self, reader: SSHReader) -> None:
+        super().decode(reader)
+        self.attributes.decode(reader)
+
+
+class Sftp9_Setstat(SftpPathAttributesPacket):
+    msgtype: ClassVar[int] = 9
+
+
+@dataclass
+class Sftp10_Fsetstat(SftpHandlePacket):
+    msgtype: ClassVar[int] = 10
+    attributes: SftpAttributes = field(default_factory=SftpAttributes)
+
+    def encode(self, writer: SSHWriter) -> None:
+        super().encode(writer)
+        self.attributes.encode(writer)
+
+    def decode(self, reader: SSHReader) -> None:
+        super().decode(reader)
+        self.attributes.decode(reader)
+
+
+class Sftp11_Opendir(SftpPathPacket):
+    msgtype: ClassVar[int] = 11
+
+
+class Sftp12_Readdir(SftpHandlePacket):
+    msgtype: ClassVar[int] = 12
+
+
+class Sftp13_Remove(SftpPathPacket):
+    msgtype: ClassVar[int] = 13
+
+
+class Sftp14_Mkdir(SftpPathAttributesPacket):
+    msgtype: ClassVar[int] = 14
+
+
+class Sftp15_Rmdir(SftpPathPacket):
+    msgtype: ClassVar[int] = 15
+
+
+class Sftp16_Realpath(SftpPathPacket):
+    msgtype: ClassVar[int] = 16
+
+
+class Sftp17_Stat(SftpPathPacket):
+    msgtype: ClassVar[int] = 17
+
+
+@dataclass
+class Sftp18_Rename(SftpPathPacket):
+    msgtype: ClassVar[int] = 18
+    new_path: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        super().encode(writer)
+        writer.writeldata(self.new_path)
+
+    def decode(self, reader: SSHReader) -> None:
+        super().decode(reader)
+        self.new_path = reader.readldata()
+
+
+class Sftp19_Readlink(SftpPathPacket):
+    msgtype: ClassVar[int] = 19
+
+
+@dataclass
+class Sftp20_Symlink(SftpPacket):
+    """OpenSSH wire order is target followed by link, opposite draft-02."""
+
+    msgtype: ClassVar[int] = 20
+    request_id: int = 0
+    target: bytes = b""
+    link: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.request_id)
+        writer.writeldata(self.target)
+        writer.writeldata(self.link)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.request_id = reader.read32be()
+        self.target = reader.readldata()
+        self.link = reader.readldata()
+
+
+@dataclass
+class Sftp101_Status(SftpPacket):
+    msgtype: ClassVar[int] = 101
+    request_id: int = 0
+    status: int = 0
+    message: bytes = b""
+    language: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.request_id)
+        writer.write32be(self.status)
+        writer.writeldata(self.message)
+        writer.writeldata(self.language)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.request_id = reader.read32be()
+        self.status = reader.read32be()
+        self.message = reader.readldata()
+        self.language = reader.readldata()
+
+
+class Sftp102_Handle(SftpHandlePacket):
+    msgtype: ClassVar[int] = 102
+
+
+@dataclass
+class Sftp103_Data(SftpPacket):
+    msgtype: ClassVar[int] = 103
+    request_id: int = 0
+    data: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.request_id)
+        writer.writeldata(self.data)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.request_id = reader.read32be()
+        self.data = reader.readldata()
+
+
+@dataclass
+class SftpName(WireObject):
+    filename: bytes = b""
+    longname: bytes = b""
+    attributes: SftpAttributes = field(default_factory=SftpAttributes)
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writeldata(self.filename)
+        writer.writeldata(self.longname)
+        self.attributes.encode(writer)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.filename = reader.readldata()
+        self.longname = reader.readldata()
+        self.attributes.decode(reader)
+
+
+@dataclass
+class Sftp104_Name(SftpPacket):
+    msgtype: ClassVar[int] = 104
+    request_id: int = 0
+    names: tuple[SftpName, ...] = ()
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.request_id)
+        writer.write32be(len(self.names))
+        for name in self.names:
+            name.encode(writer)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.request_id = reader.read32be()
+        count = reader.read32be()
+        if count > reader.remaining() // 12:
+            raise ProtocolError("truncated SFTP name list")
+        names: list[SftpName] = []
+        for _ in range(count):
+            name = SftpName()
+            name.decode(reader)
+            names.append(name)
+        self.names = tuple(names)
+
+
+@dataclass
+class Sftp105_Attrs(SftpPacket):
+    msgtype: ClassVar[int] = 105
+    request_id: int = 0
+    attributes: SftpAttributes = field(default_factory=SftpAttributes)
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.request_id)
+        self.attributes.encode(writer)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.request_id = reader.read32be()
+        self.attributes.decode(reader)
+
+
+@dataclass
+class Sftp200_Extended(SftpPacket):
+    msgtype: ClassVar[int] = 200
+    request_id: int = 0
+    extension: bytes = b""
+    undecoded: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.request_id)
+        writer.writeldata(self.extension)
+        writer.write(self.undecoded)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.request_id = reader.read32be()
+        self.extension = reader.readldata()
+        self.undecoded = reader.read(reader.remaining())
+
+
+@dataclass
+class Sftp201_ExtendedReply(SftpPacket):
+    msgtype: ClassVar[int] = 201
+    request_id: int = 0
+    undecoded: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.request_id)
+        writer.write(self.undecoded)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.request_id = reader.read32be()
+        self.undecoded = reader.read(reader.remaining())
+
+
+@dataclass
+class SftpUnknown(SftpPacket):
+    type_code: int = 0
+    undecoded: bytes = b""
+    reason: str = "unknown SFTP message type"
+
+    @property
+    def msgtype(self) -> int:
+        return self.type_code
+
+    @property
+    def name(self) -> str:
+        return f"SSH_FXP_UNKNOWN_{self.type_code}"
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write(self.undecoded)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.undecoded = reader.read(reader.remaining())
+
+
+SFTP_CLASSES: tuple[type[SftpPacket], ...] = (
+    Sftp1_Init,
+    Sftp2_Version,
+    Sftp3_Open,
+    Sftp4_Close,
+    Sftp5_Read,
+    Sftp6_Write,
+    Sftp7_Lstat,
+    Sftp8_Fstat,
+    Sftp9_Setstat,
+    Sftp10_Fsetstat,
+    Sftp11_Opendir,
+    Sftp12_Readdir,
+    Sftp13_Remove,
+    Sftp14_Mkdir,
+    Sftp15_Rmdir,
+    Sftp16_Realpath,
+    Sftp17_Stat,
+    Sftp18_Rename,
+    Sftp19_Readlink,
+    Sftp20_Symlink,
+    Sftp101_Status,
+    Sftp102_Handle,
+    Sftp103_Data,
+    Sftp104_Name,
+    Sftp105_Attrs,
+    Sftp200_Extended,
+    Sftp201_ExtendedReply,
+)
+SFTP_TYPES: dict[int, type[SftpPacket]] = {cls().msgtype: cls for cls in SFTP_CLASSES}
+
+
+@dataclass
+class SftpFrame(WireObject):
+    packet: SftpPacket = field(default_factory=Sftp1_Init)
+
+    def encode(self, writer: SSHWriter) -> None:
+        body = encode_object(self.packet)
+        writer.write32be(1 + len(body))
+        writer.writebyte(self.packet.msgtype)
+        writer.write(body)
+
+    def decode(self, reader: SSHReader) -> None:
+        length = reader.read32be()
+        if not 1 <= length <= SftpStream.max_packet:
+            raise ProtocolError("invalid SFTP frame length")
+        body = SSHReader(reader.read(length))
+        msgtype = body.readbyte()
+        data = body.read(body.remaining())
+        packet = SFTP_TYPES[msgtype]() if msgtype in SFTP_TYPES else SftpUnknown(msgtype)
+        try:
+            self.packet = decode_object(packet, data)
+        except (EOFError, ProtocolError) as exc:
+            self.packet = SftpUnknown(msgtype, data, f"malformed or unsupported body: {exc}")
+
+
+class SftpStream:
+    """Length-framed application stream; SSH channel packets are not SFTP boundaries."""
+
+    max_packet = 1024 * 1024
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+        self.version = 3
+
+    @property
+    def pending(self) -> bytes:
+        return bytes(self.buffer)
+
+    def feed(self, data: bytes) -> tuple[SftpFrame, ...]:
+        self.buffer.extend(data)
+        frames: list[SftpFrame] = []
+        while len(self.buffer) >= 4:
+            length = SSHReader(bytes(self.buffer[:4])).read32be()
+            if not 1 <= length <= self.max_packet:
+                raise ProtocolError("invalid SFTP frame length")
+            if len(self.buffer) < 4 + length:
+                break
+            frame = decode_object(SftpFrame(), bytes(self.buffer[: 4 + length]))
+            if isinstance(frame.packet, Sftp2_Version):
+                self.version = frame.packet.version
+            elif frame.packet.msgtype not in (1, 2) and self.version != 3:
+                frame.packet = SftpUnknown(frame.packet.msgtype, encode_object(frame.packet), f"SFTP version {self.version} is undecoded; only v3 is supported")
+            frames.append(frame)
+            del self.buffer[: 4 + length]
+        return tuple(frames)
+
+
 class ProtocolTrace:
     """Plaintext message tracing, after verification on receive and before encryption on send.
 
@@ -1577,6 +2157,8 @@ class ProtocolTrace:
         self.stream = stream if stream is not None else sys.stderr
         self.kex_algorithm = ""
         self.lock = threading.Lock()
+        self.sftp_streams: dict[str, SftpStream] = {}
+        self.sftp_status = "requested"
 
     def name(self, packet: SshPacket) -> str:
         if self.kex_algorithm == KEX_HYBRID and packet.msgtype in (30, 31):
@@ -1591,8 +2173,47 @@ class ProtocolTrace:
             self._write(f"{prefix} {payload.hex()}\n")
         else:
             lines = [f"{prefix} (type={packet.msgtype}, {len(payload)} bytes)"]
-            lines.extend(self._fields(packet, "  "))
+            lines.extend(self._message_fields(direction, packet))
             self._write("\n".join(lines) + "\n")
+
+    def _message_fields(self, direction: str, packet: SshPacket) -> Iterator[str]:
+        if isinstance(packet, Msg98_ChannelRequest) and isinstance(packet.request, SubsystemRequest) and packet.request.subsystem == "sftp":
+            self.sftp_streams = {"send": SftpStream(), "recv": SftpStream()}
+            self.sftp_status = "requested"
+        if self.sftp_streams and isinstance(packet, (Msg99_ChannelSuccess, Msg100_ChannelFailure)):
+            self.sftp_status = "accepted" if isinstance(packet, Msg99_ChannelSuccess) else "rejected"
+        if self.sftp_streams and isinstance(packet, Msg94_ChannelData):
+            yield f"  recipient: {packet.recipient} (0x{packet.recipient:x})"
+            yield f"  data: SFTP stream ({len(packet.data)} bytes, subsystem {self.sftp_status})"
+            yield from self._sftp_fields(self.sftp_streams[direction], packet.data)
+            return
+        yield from self._fields(packet, "  ")
+        if self.sftp_streams and isinstance(packet, (Msg96_ChannelEOF, Msg97_ChannelClose)):
+            for side, stream in self.sftp_streams.items():
+                if stream.pending and (side == direction or isinstance(packet, Msg97_ChannelClose)):
+                    yield f"  incomplete_sftp_{side}: {len(stream.pending)} undecoded bytes at channel end"
+                    yield from self._bytes(stream.pending, "    ")
+                    stream.buffer.clear()
+
+    def _sftp_fields(self, stream: SftpStream, data: bytes) -> Iterator[str]:
+        try:
+            frames = stream.feed(data)
+        except ProtocolError as exc:
+            yield f"    undecoded: invalid SFTP stream: {exc}"
+            yield from self._bytes(stream.pending, "      ")
+            stream.buffer.clear()
+            return
+        for frame in frames:
+            packet = frame.packet
+            if isinstance(packet, Sftp2_Version):
+                for side in self.sftp_streams.values():
+                    side.version = packet.version
+            length = 1 + len(encode_object(packet))
+            yield f"    {packet.name} (type={packet.msgtype}, length={length})"
+            yield from self._fields(packet, "      ")
+        if stream.pending:
+            yield f"    incomplete_sftp: {len(stream.pending)} bytes buffered (undecoded until complete)"
+            yield from self._bytes(stream.pending, "      ")
 
     def identification(self, direction: str, value: Hello | Banner) -> None:
         if not self.verbose:
@@ -1625,6 +2246,8 @@ class ProtocolTrace:
             yield from self._field("y", numbers.y, indent)
         for item in fields(value):
             field_value: object = getattr(value, item.name)
+            if isinstance(value, SftpAttributes) and field_value is None:
+                continue
             if isinstance(value, Msg20_KexInit) and item.name in value.list_fields:
                 yield f"{indent}{item.name}:"
                 names = str(field_value).split(",") if field_value else ()
@@ -1653,20 +2276,26 @@ class ProtocolTrace:
             data = value.to_bytes((value.bit_length() + 7) // 8, "big")
             yield from self._bytes(data, indent + "  ")
         elif isinstance(value, bytes):
-            yield f"{indent}{name}: {len(value)} bytes"
-            yield from self._bytes(value, indent + "  ")
+            text = self._text(value)
+            if text is not None:
+                yield f"{indent}{name}: {text!r}"
+            else:
+                yield f"{indent}{name}: {len(value)} bytes"
+                yield from self._bytes(value, indent + "  ")
         else:
             detail = f"{value} (0x{value:x})" if isinstance(value, int) and not isinstance(value, bool) else repr(value)
             yield f"{indent}{name}: {detail}"
 
     @staticmethod
-    def _bytes(data: bytes, indent: str) -> Iterator[str]:
+    def _text(data: bytes) -> str | None:
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
-            text = ""
-        if text and all(character.isprintable() or character in "\r\n\t" for character in text):
-            yield f"{indent}text: {text!r}"
+            return None
+        return text if all(character.isprintable() or character in "\r\n\t" for character in text) else None
+
+    @staticmethod
+    def _bytes(data: bytes, indent: str) -> Iterator[str]:
         for offset in range(0, len(data), 32):
             yield f"{indent}{offset:04x}: {data[offset : offset + 32].hex(' ')}"
 
@@ -2346,29 +2975,187 @@ class CommandResult:
     exit_status: int
 
 
+@dataclass
+class TerminalAttributes:
+    """Typed boundary around POSIX's seven-element tcgetattr/tcsetattr list."""
+
+    input_flags: int
+    output_flags: int
+    control_flags: int
+    local_flags: int
+    input_speed: int
+    output_speed: int
+    characters: list[bytes | int]
+
+    @classmethod
+    def read(cls, descriptor: int) -> TerminalAttributes:
+        values = termios.tcgetattr(descriptor)
+        return cls(values[0], values[1], values[2], values[3], values[4], values[5], list(values[6]))
+
+    def apply(self, descriptor: int) -> None:
+        values: list[int | list[bytes | int]] = [
+            self.input_flags,
+            self.output_flags,
+            self.control_flags,
+            self.local_flags,
+            self.input_speed,
+            self.output_speed,
+            self.characters,
+        ]
+        termios.tcsetattr(descriptor, termios.TCSANOW, values)
+
+    @staticmethod
+    def flag_field(opcode: int) -> str | None:
+        if 30 <= opcode <= 42:
+            return "input_flags"
+        if 50 <= opcode <= 62:
+            return "local_flags"
+        if 70 <= opcode <= 75:
+            return "output_flags"
+        return "control_flags" if 90 <= opcode <= 93 else None
+
+    def set_mode(self, mode: TerminalMode, disabled: int) -> None:
+        if mode.value is None or mode.opcode not in TerminalMode.names:
+            return
+        constant: int | None = getattr(termios, mode.name, None)
+        if 1 <= mode.opcode <= 18 and constant is not None:
+            if mode.value <= 255:
+                self.characters[constant] = bytes([disabled if mode.value == 255 else mode.value])
+        elif mode.opcode in (128, 129):
+            speed: int | None = getattr(termios, f"B{mode.value}", None)
+            if speed is not None:
+                setattr(self, "input_speed" if mode.opcode == 128 else "output_speed", speed)
+        elif constant is not None:
+            name = self.flag_field(mode.opcode)
+            if name is not None:
+                flags: int = getattr(self, name)
+                if mode.opcode in (90, 91):
+                    if mode.value:
+                        flags = (flags & ~termios.CSIZE) | constant
+                else:
+                    flags = flags | constant if mode.value else flags & ~constant
+                setattr(self, name, flags)
+
+    def modes(self, disabled: int) -> TerminalModes:
+        entries: list[TerminalMode] = []
+        for opcode, name in TerminalMode.names.items():
+            constant: int | None = getattr(termios, name, None)
+            if 1 <= opcode <= 18 and constant is not None:
+                character = self.characters[constant]
+                value = character if isinstance(character, int) else character[0]
+                entries.append(TerminalMode(opcode, 255 if value == disabled else value))
+            elif constant is not None and (flag_field := self.flag_field(opcode)) is not None:
+                entries.append(TerminalMode(opcode, int(bool(getattr(self, flag_field) & constant))))
+        for opcode, speed in ((128, self.input_speed), (129, self.output_speed)):
+            for name in dir(termios):
+                if name.startswith("B") and name[1:].isdigit() and getattr(termios, name) == speed:
+                    entries.append(TerminalMode(opcode, int(name[1:])))
+                    break
+        entries.append(TerminalMode(0))
+        return TerminalModes(tuple(entries))
+
+
+class PseudoTerminal:
+    def __init__(self, request: PtyRequest):
+        master, self.slave = pty.openpty()
+        self.stream = os.fdopen(master, "r+b", buffering=0)
+        try:
+            attributes = TerminalAttributes.read(self.slave)
+            disabled = os.fpathconf(self.slave, "PC_VDISABLE")
+            for mode in request.modes.entries:
+                attributes.set_mode(mode, disabled)
+            attributes.apply(self.slave)
+            self.resize(WindowChangeRequest(request.columns, request.rows, request.width_pixels, request.height_pixels))
+            os.set_blocking(master, False)
+        except BaseException:
+            self.close()
+            raise
+
+    def resize(self, request: WindowChangeRequest) -> None:
+        dimensions = struct.unpack("HHHH", fcntl.ioctl(self.stream.fileno(), termios.TIOCGWINSZ, bytes(8)))
+        requested = (request.rows, request.columns, request.width_pixels, request.height_pixels)
+        updated = tuple(min(value, 65535) if value else old for value, old in zip(requested, dimensions))
+        fcntl.ioctl(self.stream.fileno(), termios.TIOCSWINSZ, struct.pack("HHHH", *updated))
+
+    def close_slave(self) -> None:
+        if self.slave >= 0:
+            os.close(self.slave)
+            self.slave = -1
+
+    def eof_data(self) -> bytes:
+        attributes = TerminalAttributes.read(self.stream.fileno())
+        if not attributes.local_flags & termios.ICANON:
+            return b""  # A raw PTY has no byte sequence representing half-close.
+        value = attributes.characters[termios.VEOF]
+        character = bytes([value]) if isinstance(value, int) else value
+        if character == bytes([os.fpathconf(self.stream.fileno(), "PC_VDISABLE")]):
+            return b""
+        return character * 2  # Finish a partial canonical line, then report EOF.
+
+    def close(self) -> None:
+        self.close_slave()
+        if not self.stream.closed:
+            self.stream.close()
+
+
+def find_sftp_server() -> Path | None:
+    candidates = ("/usr/lib/openssh/sftp-server", "/usr/lib/ssh/sftp-server", "/usr/libexec/openssh/sftp-server", "/usr/libexec/sftp-server")
+    for candidate in candidates:
+        if Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return Path(candidate)
+    executable = shutil.which("sftp-server")
+    return Path(executable) if executable else None
+
+
+@dataclass
+class SessionConfig:
+    sftp_server: Path | None = field(default_factory=find_sftp_server)
+    allowed_environment: tuple[str, ...] = ("TERM", "COLORTERM", "LANG")
+
+    def accepts_environment(self, name: str) -> bool:
+        return name in self.allowed_environment or name.startswith("LC_")
+
+
 class ClientSession:
     def __init__(self, channel: Channel, source: BinaryIO, stdout: BinaryIO, stderr: BinaryIO):
         self.channel = channel
         self.source = source
         self.stdout = stdout
         self.stderr = stderr
+        self.resize_pending = False
         try:
             self.input_fd: int | None = source.fileno()
         except (AttributeError, io.UnsupportedOperation):
             self.input_fd = None
 
-    def run(self, command: str | None) -> int:
-        request = ExecRequest(command) if command is not None else ShellRequest()
+    def _request(self, request: RequestBody) -> None:
         self.channel.request(request)
         while self.channel.request_reply is None:
             self._packet()
             if self.channel.peer_closed:
                 raise ProtocolError("session closed before request reply")
         if not self.channel.request_reply:
-            raise ProtocolError("server rejected exec/shell request")
-        while not self.channel.peer_closed:
-            self._step()
-        return self.channel.exit_status
+            raise ProtocolError(f"server rejected {request.name} request")
+
+    def run(self, command: str | None, terminal: PtyRequest | None = None, subsystem: str | None = None) -> int:
+        if subsystem is not None and (command is not None or terminal is not None):
+            raise ValueError("subsystem cannot be combined with a command or PTY")
+        if terminal is not None:
+            self._request(terminal)
+        request = SubsystemRequest(subsystem) if subsystem is not None else ExecRequest(command) if command is not None else ShellRequest()
+        self._request(request)
+        resize = terminal is not None and self.input_fd is not None and os.isatty(self.input_fd) and threading.current_thread() is threading.main_thread()
+        previous = signal.signal(signal.SIGWINCH, self._resize) if resize else None
+        try:
+            while not self.channel.peer_closed:
+                self._step()
+            return self.channel.exit_status
+        finally:
+            if previous is not None:
+                signal.signal(signal.SIGWINCH, previous)
+
+    def _resize(self, number: int, frame: object) -> None:
+        self.resize_pending = True
 
     def _step(self) -> None:
         channel = self.channel
@@ -2381,13 +3168,17 @@ class ClientSession:
         immediate = can_input and self.input_fd is None and not channel.sent_eof
         transport = channel.connection.transport
         writers = [transport.sock] if transport.outgoing else []
-        ready, writable, _ = select.select(readers, writers, [], 0 if immediate else None)
+        ready, writable, _ = select.select(readers, writers, [], 0 if immediate else 0.25)
         if writable:
             transport.flush()
         if channel.connection.transport.sock in ready:
             self._packet()
         if self.input_fd is not None and self.input_fd in ready and not channel.peer_closed:
             self._input()
+        if self.resize_pending and self.input_fd is not None and not channel.peer_closed:
+            self.resize_pending = False
+            size = os.get_terminal_size(self.input_fd)
+            channel.request(WindowChangeRequest(size.columns, size.lines), want_reply=False)
 
     def _input(self) -> None:
         count = min(self.channel.send_window, self.channel.max_packet)
@@ -2429,24 +3220,34 @@ class SSHClient:
     def authenticate_publickey(self, username: str, private_key: ed25519.Ed25519PrivateKey) -> None:
         client_publickey_authenticate(self.connection, username, private_key)
 
-    def run(self, command: str | None, input_data: bytes = b"") -> CommandResult:
+    def run(self, command: str | None, input_data: bytes = b"", *, terminal: PtyRequest | None = None) -> CommandResult:
         stdout, stderr = io.BytesIO(), io.BytesIO()
-        status = self.run_stream(command, io.BytesIO(input_data), stdout, stderr)
+        status = self.run_stream(command, io.BytesIO(input_data), stdout, stderr, terminal=terminal)
         return CommandResult(stdout.getvalue(), stderr.getvalue(), status)
 
-    def run_stream(self, command: str | None, source: BinaryIO, stdout: BinaryIO, stderr: BinaryIO) -> int:
+    def run_stream(
+        self, command: str | None, source: BinaryIO, stdout: BinaryIO, stderr: BinaryIO, *, terminal: PtyRequest | None = None, subsystem: str | None = None
+    ) -> int:
         channel = Channel.open_client(self.connection)
-        return ClientSession(channel, source, stdout, stderr).run(command)
+        return ClientSession(channel, source, stdout, stderr).run(command, terminal, subsystem)
+
+    def run_subsystem(self, subsystem: str, source: BinaryIO, stdout: BinaryIO, stderr: BinaryIO) -> int:
+        return self.run_stream(None, source, stdout, stderr, subsystem=subsystem)
 
     def close(self) -> None:
         self.connection.close()
 
 
 class ServerSession:
-    """Non-PTY shell/exec session with full-duplex, bounded pipe forwarding."""
+    """Shell/exec, PTY, or SFTP process with bounded, full-duplex channel forwarding."""
 
-    def __init__(self, channel: Channel):
+    def __init__(self, channel: Channel, config: SessionConfig | None = None):
         self.channel = channel
+        self.config = config if config is not None else SessionConfig()
+        self.terminal: PseudoTerminal | None = None
+        self.terminal_name = ""
+        self.environment: dict[str, str] = {}
+        self.input_descriptor: int | None = None
         self.process: subprocess.Popen[bytes] | None = None
         self.outputs: dict[int, tuple[IO[bytes], int]] = {}
         self.pending_input = bytearray()
@@ -2468,33 +3269,81 @@ class ServerSession:
         if command is not None and "\x00" in command:
             raise ProtocolError("NUL in exec command")
         arguments = ["/bin/sh"] if command is None else ["/bin/sh", "-c", command]
-        process = subprocess.Popen(arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
+        self._start_program(arguments)
+
+    def _start_program(self, arguments: list[str]) -> None:
+        environment = os.environ | self.environment
+        if self.terminal is not None:
+            environment["TERM"] = self.terminal_name
+            arguments = [sys.executable, str(Path(__file__).resolve()), "--_pty-exec", *arguments]
+            try:
+                process = subprocess.Popen(
+                    arguments,
+                    stdin=self.terminal.slave,
+                    stdout=self.terminal.slave,
+                    stderr=self.terminal.slave,
+                    start_new_session=True,
+                    env=environment,
+                    bufsize=0,
+                )
+            finally:
+                self.terminal.close_slave()
+            self.input_descriptor = self.terminal.stream.fileno()
+            self.outputs[self.input_descriptor] = (self.terminal.stream, 0)
+        else:
+            process = subprocess.Popen(
+                arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, env=environment, bufsize=0
+            )
+            assert process.stdin and process.stdout and process.stderr
+            self.input_descriptor = process.stdin.fileno()
+            for stream, kind in ((process.stdout, 0), (process.stderr, 1)):
+                os.set_blocking(stream.fileno(), False)
+                self.outputs[stream.fileno()] = (stream, kind)
+        assert self.input_descriptor is not None
+        os.set_blocking(self.input_descriptor, False)
         self.process = process
-        assert process.stdin and process.stdout and process.stderr
-        for stream in (process.stdin, process.stdout, process.stderr):
-            os.set_blocking(stream.fileno(), False)
-        self.outputs[process.stdout.fileno()] = (process.stdout, 0)
-        self.outputs[process.stderr.fileno()] = (process.stderr, 1)
 
     def _request(self, packet: Msg98_ChannelRequest) -> None:
         request = packet.request
         success = False
-        if isinstance(request, (ExecRequest, ShellRequest)) and self.process is None:
-            command = request.command if isinstance(request, ExecRequest) else None
-            try:
+        try:
+            if isinstance(request, PtyRequest) and self.process is None and self.terminal is None:
+                if b"\x00" in request.terminal:
+                    raise ProtocolError("NUL in terminal name")
+                self.terminal = PseudoTerminal(request)
+                self.terminal_name = os.fsdecode(request.terminal) or "dumb"
+                success = True
+            elif isinstance(request, WindowChangeRequest) and self.terminal is not None:
+                self.terminal.resize(request)
+                success = True
+            elif isinstance(request, EnvRequest) and self.process is None:
+                success = self._environment(request)
+            elif isinstance(request, SubsystemRequest) and request.subsystem == "sftp" and self.process is None and self.terminal is None:
+                if self.config.sftp_server is not None:
+                    self._start_program([str(self.config.sftp_server)])
+                    success = True
+            elif isinstance(request, (ExecRequest, ShellRequest)) and self.process is None:
+                command = request.command if isinstance(request, ExecRequest) else None
                 self._start(command)
                 success = True
-            except OSError:
-                success = False
-        elif isinstance(request, SignalRequest) and self.process is not None:
-            allowed = {"INT": signal.SIGINT, "TERM": signal.SIGTERM, "HUP": signal.SIGHUP, "KILL": signal.SIGKILL}
-            if request.signal in allowed and self.process.poll() is None:
-                os.killpg(self.process.pid, allowed[request.signal])
-                success = True
-        # PTY allocation, environment changes, and other unsupported requests
-        # are explicitly rejected, never reported as successfully applied.
+            elif isinstance(request, SignalRequest) and self.process is not None:
+                allowed = {"INT": signal.SIGINT, "TERM": signal.SIGTERM, "HUP": signal.SIGHUP, "KILL": signal.SIGKILL}
+                if request.signal in allowed and self.process.poll() is None:
+                    os.killpg(self.process.pid, allowed[request.signal])
+                    success = True
+        except (OSError, ValueError):
+            success = False
         if packet.want_reply:
             self.channel.reply(success)
+
+    def _environment(self, request: EnvRequest) -> bool:
+        if not request.variable or b"\x00" in request.variable or b"=" in request.variable or b"\x00" in request.value:
+            return False
+        name = os.fsdecode(request.variable)
+        if not self.config.accepts_environment(name):
+            return False
+        self.environment[name] = os.fsdecode(request.value)
+        return True
 
     def _packet(self) -> None:
         event = self.channel.handle(self.channel.connection.receive())
@@ -2512,21 +3361,34 @@ class ServerSession:
 
     def _close_stdin(self) -> None:
         if not self.stdin_closed:
-            assert self.process is not None and self.process.stdin is not None
-            self.process.stdin.close()
+            if self.terminal is not None:
+                self.pending_input.extend(self.terminal.eof_data())
+            else:
+                assert self.process is not None and self.process.stdin is not None
+                self.process.stdin.close()
             self.stdin_closed = True
 
     def _write_stdin(self) -> None:
-        assert self.process is not None and self.process.stdin is not None
+        assert self.input_descriptor is not None
         try:
-            count = os.write(self.process.stdin.fileno(), self.pending_input)
+            count = os.write(self.input_descriptor, self.pending_input)
         except BlockingIOError:
             return
-        except BrokenPipeError:
+        except OSError as exc:
+            if exc.errno not in (errno.EPIPE, errno.EIO):
+                raise
             count = len(self.pending_input)
-            self._close_stdin()
+            self.stdin_closed = True
+            if self.terminal is None:
+                self._close_pipe()
         del self.pending_input[:count]
-        self.channel.acknowledge(count)
+        # Locally synthesized PTY EOF characters consume no SSH receive credit.
+        credit = min(count, CHANNEL_WINDOW - self.channel.recv_window)
+        self.channel.acknowledge(credit)
+
+    def _close_pipe(self) -> None:
+        if self.process is not None and self.process.stdin is not None and not self.process.stdin.closed:
+            self.process.stdin.close()
 
     def _read_output(self, descriptor: int) -> None:
         channel = self.channel
@@ -2535,16 +3397,24 @@ class ServerSession:
             data = os.read(descriptor, min(channel.send_window, channel.max_packet))
         except BlockingIOError:
             return
+        except OSError as exc:
+            if self.terminal is None or exc.errno != errno.EIO:
+                raise
+            data = b""  # Linux PTY masters report EIO when the final slave closes.
         if not data:
             del self.outputs[descriptor]
             stream.close()
+            if self.terminal is not None:
+                self.stdin_closed = True
+                self.channel.acknowledge(min(len(self.pending_input), CHANNEL_WINDOW - self.channel.recv_window))
+                self.pending_input.clear()
         else:
             if channel.send_data(data, kind) != len(data):
                 raise ProtocolError("internal channel-window accounting error")
 
     def _step(self) -> None:
-        assert self.process is not None and self.process.stdin is not None
-        if self.channel.peer_eof and not self.pending_input:
+        assert self.process is not None
+        if self.channel.peer_eof and not self.pending_input and not self.stdin_closed:
             self._close_stdin()
         network = self.channel.connection.transport.sock
         readers: list[int | socket.socket] = [network]
@@ -2553,8 +3423,9 @@ class ServerSession:
         writers: list[int | socket.socket] = []
         if self.channel.connection.transport.outgoing:
             writers.append(network)
-        if self.pending_input and not self.stdin_closed:
-            writers.append(self.process.stdin.fileno())
+        if self.pending_input and (not self.stdin_closed or self.terminal is not None):
+            assert self.input_descriptor is not None
+            writers.append(self.input_descriptor)
         ready, writable, _ = select.select(readers, writers, [], 0.25)
         if network in writable:
             self.channel.connection.transport.flush()
@@ -2565,7 +3436,7 @@ class ServerSession:
         for descriptor in ready:
             if isinstance(descriptor, int) and self.channel.send_window:
                 self._read_output(descriptor)
-        if not self.stdin_closed and self.process.stdin.fileno() in writable:
+        if self.pending_input and self.input_descriptor in writable:
             self._write_stdin()
 
     def _finish(self) -> None:
@@ -2594,6 +3465,8 @@ class ServerSession:
                 break
 
     def _cleanup(self) -> None:
+        if self.terminal is not None:
+            self.terminal.close()
         if self.process is None:
             return
         if self.process.poll() is None:
@@ -2614,7 +3487,13 @@ class SSHServer:
     """Configured login; commands run as the existing OS user."""
 
     def __init__(
-        self, host_key: ed25519.Ed25519PrivateKey, credentials: Credentials, curve_only: bool = False, verbose: int = 0, trace_stream: TextIO | None = None
+        self,
+        host_key: ed25519.Ed25519PrivateKey,
+        credentials: Credentials,
+        curve_only: bool = False,
+        verbose: int = 0,
+        trace_stream: TextIO | None = None,
+        session_config: SessionConfig | None = None,
     ):
         if not credentials.methods():
             raise ValueError("server requires a password or an authorized user key")
@@ -2623,13 +3502,14 @@ class SSHServer:
         self.curve_only = curve_only
         self.verbose = verbose
         self.trace_stream = trace_stream
+        self.session_config = session_config if session_config is not None else SessionConfig()
 
     def serve(self, sock: socket.socket) -> None:
         connection: Connection | None = None
         try:
             connection = Connection(sock, server=True, host_key=self.host_key, curve_only=self.curve_only, verbose=self.verbose, trace_stream=self.trace_stream)
             server_authenticate(connection, self.credentials)
-            ServerSession(Channel.open_server(connection)).run()
+            ServerSession(Channel.open_server(connection), self.session_config).run()
         finally:
             if connection is not None:
                 connection.close()
@@ -2693,6 +3573,34 @@ def read_password(password: str | None) -> str:
     return getpass.getpass("Password: ")
 
 
+@contextmanager
+def local_terminal(enabled: bool, source: BinaryIO) -> Iterator[PtyRequest | None]:
+    if not enabled:
+        yield None
+        return
+    descriptor = source.fileno()
+    size = shutil.get_terminal_size((80, 24))
+    request = PtyRequest(os.fsencode(os.environ.get("TERM", "xterm")), size.columns, size.lines)
+    original: TerminalAttributes | None = None
+    if os.isatty(descriptor):
+        original = TerminalAttributes.read(descriptor)
+        request.modes = original.modes(os.fpathconf(descriptor, "PC_VDISABLE"))
+        tty.setraw(descriptor)
+    try:
+        yield request
+    finally:
+        if original is not None:
+            original.apply(descriptor)
+
+
+def pty_child(arguments: list[str]) -> None:
+    """Popen has created a new session; acquire its controlling terminal before exec."""
+    if not arguments:
+        raise ValueError("missing PTY child command")
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+    os.execvpe(arguments[0], arguments, os.environ)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="mode", required=True)
@@ -2700,7 +3608,7 @@ def build_parser() -> argparse.ArgumentParser:
     keygen.add_argument("path", type=Path)
     decode = commands.add_parser("decode", help="decode a direction-marked hex capture")
     decode.add_argument("path", type=Path)
-    server = commands.add_parser("server", help="authenticated non-PTY shell/exec")
+    server = commands.add_parser("server", help="authenticated shell, PTY, and SFTP sessions")
     client = commands.add_parser("client", help="connect and run a shell/command")
     for endpoint in (server, client):
         endpoint.add_argument("-v", "--verbose", action="count", default=0, help="trace message hex; repeat for decoded fields")
@@ -2713,7 +3621,10 @@ def build_parser() -> argparse.ArgumentParser:
     server.add_argument("-a", "--authorized-key", type=Path, help="allow this Ed25519 user public key")
     server.add_argument("-l", "--listen", default="127.0.0.1")
     server.add_argument("-o", "--once", action="store_true")
+    server.add_argument("-s", "--sftp-server", type=Path, help="OpenSSH sftp-server executable; otherwise autodetect")
     client.add_argument("-i", "--identity", type=Path, help="Ed25519 user private key")
+    client.add_argument("-T", "--pty", action="store_true", help="request a PTY; use local raw mode when stdin is a terminal")
+    client.add_argument("-s", "--subsystem", help="run a subsystem, e.g. sftp; stdin/stdout carry its binary protocol")
     client.add_argument("host")
     client.add_argument("command", nargs=argparse.REMAINDER, help="remote command; omit for a non-PTY shell")
     return parser
@@ -2724,7 +3635,8 @@ def run_server(args: argparse.Namespace) -> None:
     key_only = bool(authorized) and args.password is None and "SSH_PASSWORD" not in os.environ
     password = None if key_only else read_password(args.password)
     credentials = Credentials(args.user, password, authorized)
-    server = SSHServer(load_private_key(args.host_key), credentials, args.curve25519, verbose=args.verbose)
+    config = SessionConfig() if args.sftp_server is None else SessionConfig(args.sftp_server)
+    server = SSHServer(load_private_key(args.host_key), credentials, args.curve25519, verbose=args.verbose, session_config=config)
     with socket.create_server((args.listen, args.port)) as listener:
         print(f"Listening on {args.listen}:{listener.getsockname()[1]}", file=sys.stderr)
         while True:
@@ -2749,10 +3661,14 @@ def run_client(args: argparse.Namespace) -> int:
             assert password is not None
             client.authenticate(args.user, password)
         command = " ".join(args.command) if args.command else None
-        return client.run_stream(command, sys.stdin.buffer, sys.stdout.buffer, sys.stderr.buffer)
+        with local_terminal(args.pty, sys.stdin.buffer) as terminal:
+            return client.run_stream(command, sys.stdin.buffer, sys.stdout.buffer, sys.stderr.buffer, terminal=terminal, subsystem=args.subsystem)
 
 
 def main() -> int:
+    if sys.argv[1:2] == ["--_pty-exec"]:
+        pty_child(sys.argv[2:])
+        return 255
     args = build_parser().parse_args()
     try:
         if args.mode == "keygen":

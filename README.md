@@ -24,16 +24,19 @@ python -m pip install -r requirements.txt
 | Encryption/integrity | `chacha20-poly1305@openssh.com` |
 | Compression | `none` |
 | Authentication | Password and Ed25519 user public key |
-| Sessions | One non-PTY shell or exec channel per TCP connection |
+| Sessions | One shell, exec, PTY, or SFTP channel per TCP connection |
+| PTY | Controlling terminal, terminal modes, dimensions, window changes, merged stdout/stderr |
+| Environment | `TERM`, `COLORTERM`, `LANG`, and `LC_*` before process start |
+| SFTP | System OpenSSH `sftp-server`; typed version-3 protocol tracing |
 | Channel I/O | Binary stdin, stdout, stderr; EOF, exit status, window control |
 | Rekeying | Either peer can initiate; automatic local byte/time thresholds |
 | Host verification | Optional Ed25519 `.pub` pin; otherwise accept the presented key and warn |
 
-PTY allocation, client-supplied environment changes, SFTP/subsystems, forwarding, SSH-1, host certificates,
-other cryptographic algorithms, and multiple concurrent session channels are
-not implemented. Unsupported requests are rejected rather than acknowledged
-as successful. A plain shell is available through `ssh -T` or by omitting the
-Python client's command; terminal editors and job control require a PTY.
+Forwarding, SSH-1, host certificates, other cryptographic algorithms,
+unconfigured subsystems, and multiple concurrent session channels are not
+implemented. Unsupported requests are rejected. A plain shell is available
+through `ssh -T` or by omitting the Python client's command; request a PTY
+for terminal editors and job control.
 
 The server's configured SSH username does **not** select or impersonate a Unix
 account. Commands run as the OS user that started the server. The CLI serves
@@ -88,8 +91,8 @@ an entire isolated object; they do not replace its reader/writer interface.
 There are 29 declared message types. Authentication-method fields live in
 `NoneAuth`, `PasswordAuth`, `PublicKeyAuth`, or `UnknownAuth`. Channel request
 fields live in `ShellRequest`, `ExecRequest`, `SignalRequest`,
-`ExitStatusRequest`, `ExitSignalRequest`, `PtyRequest`, `EnvRequest`, or
-`OpaqueRequest`.
+`ExitStatusRequest`, `ExitSignalRequest`, `PtyRequest`, `EnvRequest`,
+`SubsystemRequest`, `WindowChangeRequest`, or `OpaqueRequest`.
 All use the same instance encode/decode interface. Unknown messages retain
 their complete body in `RawPacket`; unsupported method/request payloads remain
 explicitly opaque. `EncryptedData` denotes undecoded ciphertext.
@@ -112,10 +115,16 @@ unchanged. Empty mode strings are accepted; truncated arguments and nonempty
 lists without a stop opcode are rejected.
 
 Terminal names and `EnvRequest` variable/value strings retain their original
-bytes, including values that are not UTF-8. Tracing shows readable text and
-the full bytes. These classes provide decoding and encoding only: the server
-continues to reject PTY allocation and environment changes when a reply is
-requested, and does not apply them to commands.
+bytes, including values that are not UTF-8. Tracing renders pure UTF-8 text
+as a quoted field and binary data as full hex. The server applies supported
+terminal modes and accepted environment requests before starting a process.
+
+SFTP has 27 declared message classes covering the version-3 messages,
+plus `SftpAttributes`, `SftpName`, `SftpExtension`, and `SftpFrame`, all with
+the same instance encode/decode interface. `SftpStream` assembles length-prefixed
+packets across SSH channel messages, including multiple packets in one message.
+Unknown types, malformed bodies, later protocol versions, and extension-specific
+bodies remain explicitly undecoded and preserve their original bytes.
 
 `HostKey`, `Signature`, `Hello`, `HybridInit`, and `HybridReply` also use this
 interface. Message types 30/31 have the same outer format for Curve25519 and
@@ -178,6 +187,9 @@ a mismatch fails before user authentication.
 | `--once` | `-o` | Serve one connection |
 | `--curve25519` | `-c` | Disable hybrid ML-KEM |
 | `--timeout` | `-t` | Incomplete network-read timeout, default 30 seconds |
+| `--pty` | `-T` | Client: allocate a PTY and use local terminal raw mode |
+| `--subsystem` | `-s` | Client: run a subsystem instead of a shell/command |
+| `--sftp-server` | `-s` | Server: path to the OpenSSH SFTP executable; otherwise autodetect |
 
 An OpenSSH client can connect too:
 
@@ -185,6 +197,55 @@ An OpenSSH client can connect too:
 ssh -T -o PreferredAuthentications=password \
     -o PubkeyAuthentication=no testuser@127.0.0.1 'printf hello'
 ```
+
+## PTY and SFTP sessions
+
+Request a PTY using this Python client or OpenSSH:
+
+```sh
+python ssh.py client -T -u testuser 127.0.0.1
+ssh -tt testuser@127.0.0.1
+```
+
+In this script, `-T` means `--pty`; the existing `-t` remains `--timeout`.
+OpenSSH uses different flags: `-t`/`-tt` requests a PTY and `-T` disables it.
+The Python CLI restores the local terminal on exit, including exceptions,
+and forwards window changes while running in the main thread. The child
+gets a controlling terminal; terminal output, including stderr, shares the
+PTY's stdout stream. In canonical mode, SSH EOF is translated to the configured
+VEOF character. A raw PTY has no input half-close operation, so its program
+must exit through its protocol, terminal input, a signal, or channel close.
+
+The server accepts `TERM`, `COLORTERM`, `LANG`, and names starting with `LC_`
+before starting the child. Invalid names, NUL bytes, other variables, and
+changes after process start are rejected. `SessionConfig.allowed_environment`
+can extend the accepted exact names for API users.
+
+SFTP uses the installed OpenSSH `sftp-server`, autodetected at common Linux
+and BSD paths or on `PATH`. No `sshd` process is involved. If it is installed
+elsewhere, configure its executable explicitly:
+
+```sh
+python ssh.py server -k host_ed25519 -u testuser -s /usr/lib/ssh/sftp-server
+sftp testuser@127.0.0.1
+```
+
+The SFTP helper runs as the OS user that started this server, with that user's
+filesystem permissions. There is no additional filesystem sandbox or account
+switch. A missing helper or unknown subsystem causes channel-request failure;
+success is sent only after spawning the configured process. Combining SFTP
+with a PTY is rejected to preserve the binary protocol.
+
+The Python client can carry a subsystem's binary protocol on stdin/stdout:
+
+```sh
+python ssh.py client -s sftp -u testuser 127.0.0.1
+```
+
+This is a protocol stream, not an interactive SFTP command interpreter.
+Use OpenSSH's `sftp` for commands such as `put`, `get`, and `ls`. A subsystem
+client must read responses while keeping its input open; closing stdin can
+make the helper exit before queued responses are delivered.
 
 ## Protocol tracing
 
@@ -219,9 +280,10 @@ Use `-vv` (or repeat `--verbose`) for the decoded representation instead:
 ```
 
 Nested authentication and request structures retain named fields. Algorithm
-lists are shown one entry per line; binary values include lengths and full
-offset-labelled hex dumps, plus text where readable. Control characters in
-text are escaped. Hybrid key-exchange messages are named according to the
+lists are shown one entry per line. Pure UTF-8 text appears once, for example
+`variable: 'COLORTERM'` and `value: 'truecolor'`. Quotes, backslashes, tabs,
+and newlines are escaped so the representation stays lossless. Other binary
+values include lengths and full offset-labelled hex dumps. Hybrid key-exchange messages are named according to the
 negotiated algorithm. `-vvv` and higher use the same decoded format as `-vv`.
 The timestamp appears once on the message header; decoded fields remain
 grouped underneath. Host-key advertisements include SHA-256 fingerprints,
@@ -231,6 +293,15 @@ PTY requests show terminal dimensions and named modes such as `VINTR`,
 `ICANON`, `ECHO`, `IUTF8`, and input/output speeds. Control-character modes
 also show caret notation or `disabled`. Environment requests show the
 variable name and value as separate fields.
+
+After observing a request for the `sftp` subsystem, `-vv` decodes channel data
+as SFTP frames. The nine bytes `00 00 00 05 01 00 00 00 03` become
+`SSH_FXP_INIT (type=1, length=5)` with `version: 3`. Each direction has its
+own assembly buffer. Incomplete packets retain explicit raw bytes until a
+complete frame arrives; unfinished data is reported at channel EOF/close.
+The log marks whether the subsystem request was accepted or rejected, so
+inspection of traffic after a failed request does not imply a valid session.
+`-v` continues to show the exact SSH message hex without reformatting it.
 
 Tracing goes to stderr, leaving command stdout unchanged. This is a full
 plaintext trace: passwords and channel contents are included. The default
@@ -279,13 +350,23 @@ Trace tests cover microsecond timestamp formatting at both verbosity levels.
 The PTY/environment captures check dimensions, mode parameters, environment
 strings, and exact round trips. Additional tests cover unknown modes,
 stop opcodes, retained undecoded tails, duplicate modes, binary strings,
-every truncated capture prefix, and continued rejection of unsupported
-PTY/environment operations.
+every truncated capture prefix, and PTY/environment request handling.
+SFTP tests cover the supplied subsystem and INIT captures, all 27 message
+interfaces, attributes, fragmentation/coalescing, invalid input, and opaque
+extension bodies. Live tests cover controlling-terminal access, terminal
+modes, canonical EOF, a 3 MiB raw PTY transfer, running-process resize signals,
+local terminal restoration, and OpenSSH SFTP upload/download/list/rename/
+symlink/removal operations in temporary directories.
 
-Validated here: **57 SSH tests plus 18 original helper tests**, all passing.
+Validated here: **79 SSH tests (78 passed, one environment skip) plus
+18 original helper tests**, all checks passing. The skipped test is the
+Python PTY client against an unprivileged `sshd`: this container prevents
+`sshd` from changing `/dev/pts` ownership. The Python PTY client/server and
+OpenSSH client against this script's PTY server are independently tested.
 OpenSSH 10.0p2 independently verified both endpoints with both KEX methods;
 rekeys during live transfers and after authentication were also tested.
-OpenSSH-specific tests skip only when the relevant executable is absent.
+OpenSSH-specific tests skip when an executable is absent or the documented
+unprivileged PTY limitation is encountered.
 The unprivileged `sshd -i` tests use temporary keys/configuration and the
 current OS account; they do not modify its password or SSH configuration.
 
@@ -313,6 +394,11 @@ with socket.create_connection(("127.0.0.1", 22), timeout=30) as sock:
 streams for large transfers. Socket timeouts apply to incomplete reads, not
 the total command duration. A `Connection`, and its channel/session objects,
 are driven from one application thread; each connection has its own state.
+Pass `terminal=PtyRequest(...)` to `run`/`run_stream` to request a PTY.
+`run_subsystem(name, source, stdout, stderr)` forwards a binary subsystem
+stream. The caller supplies its application protocol and coordinates requests
+and replies. `SSHServer(..., session_config=SessionConfig(...))` selects the
+SFTP executable and accepted exact environment names.
 
 ## Protocol references
 
@@ -323,5 +409,7 @@ are driven from one application thread; each connection has its own state.
 - [RFC 8160: IUTF8 terminal mode](https://www.rfc-editor.org/rfc/rfc8160.html)
 - [RFC 8731: Curve25519](https://www.rfc-editor.org/rfc/rfc8731.html)
 - [RFC 8709: Ed25519](https://www.rfc-editor.org/rfc/rfc8709.html)
+- [SFTP version 3](https://www.ietf.org/archive/id/draft-ietf-secsh-filexfer-02.txt)
+- [OpenSSH sftp-server](https://man.openbsd.org/sftp-server)
 - [OpenSSH ML-KEM/X25519 implementation](https://github.com/openssh/openssh-portable/blob/master/kexmlkem768x25519.c)
 - [OpenSSH ChaCha20-Poly1305 construction](https://www.ietf.org/archive/id/draft-ietf-sshm-chacha20-poly1305-00.html)

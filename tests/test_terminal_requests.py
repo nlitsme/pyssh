@@ -114,19 +114,20 @@ class TerminalRequestTests(unittest.TestCase):
         self.assertNotIn("OpaqueRequest", text)
         self.assertTrue(text.startswith("20:15:44.140694 recv SSH_MSG_CHANNEL_REQUEST"))
 
-    def test_decoding_does_not_apply_terminal_or_environment_settings(self) -> None:
+    def test_pty_and_environment_requests_are_applied_before_start(self) -> None:
         channel = Mock(spec=ssh.Channel)
         session = ssh.ServerSession(channel)
-        for name in ("pty-req", "env"):
-            for want_reply in (False, True):
+        try:
+            for name in ("pty-req", "env"):
                 channel.reply.reset_mock()
-                packet = ssh.decode_message(ssh.SSHReader(captured_request(name, want_reply)))
+                packet = ssh.decode_message(ssh.SSHReader(captured_request(name, True)))
                 session._request(packet)
                 self.assertIsNone(session.process)
-                if want_reply:
-                    channel.reply.assert_called_once_with(False)
-                else:
-                    channel.reply.assert_not_called()
+                channel.reply.assert_called_once_with(True)
+            self.assertIsNotNone(session.terminal)
+            self.assertEqual(session.environment["COLORTERM"], "truecolor")
+        finally:
+            session._cleanup()
 
 
 if __name__ == "__main__":
