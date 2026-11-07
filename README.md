@@ -8,6 +8,8 @@ authentication, channels, and connection state are implemented here.
 The purpose of this python implementation is to get a overview of all messages
 and operations involved in the ssh protocol.
 
+Note that this was mostly written by chatgpt, under my guidance.
+
 
 ## Requirements
 
