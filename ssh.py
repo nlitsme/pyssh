@@ -991,6 +991,186 @@ class RequestBody(WireObject):
         raise NotImplementedError
 
 
+@dataclass
+class TerminalMode(WireObject):
+    """One terminal opcode and, for opcodes 1..159, its uint32 argument."""
+
+    opcode: int = 0
+    value: int | None = None
+    names: ClassVar[dict[int, str]] = {
+        0: "TTY_OP_END",
+        1: "VINTR",
+        2: "VQUIT",
+        3: "VERASE",
+        4: "VKILL",
+        5: "VEOF",
+        6: "VEOL",
+        7: "VEOL2",
+        8: "VSTART",
+        9: "VSTOP",
+        10: "VSUSP",
+        11: "VDSUSP",
+        12: "VREPRINT",
+        13: "VWERASE",
+        14: "VLNEXT",
+        15: "VFLUSH",
+        16: "VSWTCH",
+        17: "VSTATUS",
+        18: "VDISCARD",
+        30: "IGNPAR",
+        31: "PARMRK",
+        32: "INPCK",
+        33: "ISTRIP",
+        34: "INLCR",
+        35: "IGNCR",
+        36: "ICRNL",
+        37: "IUCLC",
+        38: "IXON",
+        39: "IXANY",
+        40: "IXOFF",
+        41: "IMAXBEL",
+        42: "IUTF8",
+        50: "ISIG",
+        51: "ICANON",
+        52: "XCASE",
+        53: "ECHO",
+        54: "ECHOE",
+        55: "ECHOK",
+        56: "ECHONL",
+        57: "NOFLSH",
+        58: "TOSTOP",
+        59: "IEXTEN",
+        60: "ECHOCTL",
+        61: "ECHOKE",
+        62: "PENDIN",
+        70: "OPOST",
+        71: "OLCUC",
+        72: "ONLCR",
+        73: "OCRNL",
+        74: "ONOCR",
+        75: "ONLRET",
+        90: "CS7",
+        91: "CS8",
+        92: "PARENB",
+        93: "PARODD",
+        128: "TTY_OP_ISPEED",
+        129: "TTY_OP_OSPEED",
+    }
+
+    @property
+    def name(self) -> str:
+        unknown = "UNKNOWN_STOP_OPCODE" if self.is_stop() else "UNKNOWN_TERMINAL_MODE"
+        return self.names.get(self.opcode, f"{unknown}_{self.opcode}")
+
+    def is_stop(self) -> bool:
+        return self.opcode == 0 or self.opcode >= 160
+
+    def encode(self, writer: SSHWriter) -> None:
+        if not 0 <= self.opcode <= 255:
+            raise ProtocolError("terminal opcode must fit in a byte")
+        if self.is_stop() != (self.value is None):
+            raise ProtocolError("terminal argument required only for opcodes 1..159")
+        writer.writebyte(self.opcode)
+        if self.value is not None:
+            writer.write32be(self.value)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.opcode = reader.readbyte()
+        self.value = None if self.is_stop() else reader.read32be()
+
+    def description(self) -> str:
+        text = f"{self.name} (opcode={self.opcode})"
+        if self.value is None:
+            return text
+        text += f" value={self.value} (0x{self.value:x})"
+        if 1 <= self.opcode <= 18 and self.value <= 255:
+            character = "disabled" if self.value == 255 else self._character(self.value)
+            text += f" [{character}]"
+        return text
+
+    @staticmethod
+    def _character(value: int) -> str:
+        if value < 32:
+            return "^" + chr(value + 64)
+        return "^?" if value == 127 else repr(bytes([value]))
+
+
+@dataclass
+class TerminalModes(WireObject):
+    """Ordered modes including the stop opcode; retain any bytes after it."""
+
+    entries: tuple[TerminalMode, ...] = ()
+    undecoded: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        if self.entries and not self.entries[-1].is_stop():
+            raise ProtocolError("terminal modes missing stop opcode")
+        if not self.entries and self.undecoded:
+            raise ProtocolError("undecoded terminal bytes require a stop opcode")
+        for index, entry in enumerate(self.entries):
+            if entry.is_stop() and index != len(self.entries) - 1:
+                raise ProtocolError("terminal entries after stop opcode")
+            entry.encode(writer)
+        writer.write(self.undecoded)
+
+    def decode(self, reader: SSHReader) -> None:
+        entries: list[TerminalMode] = []
+        self.entries = ()
+        self.undecoded = b""
+        while reader.remaining():
+            entry = TerminalMode()
+            entry.decode(reader)
+            entries.append(entry)
+            if entry.is_stop():
+                self.entries = tuple(entries)
+                self.undecoded = reader.read(reader.remaining())
+                return
+        if entries:
+            raise ProtocolError("terminal modes missing stop opcode")
+
+
+@dataclass
+class PtyRequest(RequestBody):
+    name: ClassVar[str] = "pty-req"
+    terminal: bytes = b""
+    columns: int = 0
+    rows: int = 0
+    width_pixels: int = 0
+    height_pixels: int = 0
+    modes: TerminalModes = field(default_factory=TerminalModes)
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writeldata(self.terminal)
+        writer.write32be(self.columns)
+        writer.write32be(self.rows)
+        writer.write32be(self.width_pixels)
+        writer.write32be(self.height_pixels)
+        writer.writeldata(encode_object(self.modes))
+
+    def decode(self, reader: SSHReader) -> None:
+        self.terminal = reader.readldata()
+        self.columns = reader.read32be()
+        self.rows = reader.read32be()
+        self.width_pixels = reader.read32be()
+        self.height_pixels = reader.read32be()
+        self.modes = decode_object(TerminalModes(), reader.readldata())
+
+
+@dataclass
+class EnvRequest(RequestBody):
+    name: ClassVar[str] = "env"
+    variable: bytes = b""
+    value: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writeldata(self.variable)
+        writer.writeldata(self.value)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.variable = reader.readldata()
+        self.value = reader.readldata()
+
+
 class ShellRequest(RequestBody):
     name = "shell"
 
@@ -1090,6 +1270,8 @@ class Msg98_ChannelRequest(ChannelMessage):
         name = reader.readlstr()
         self.want_reply = reader.readboolean()
         requests: dict[str, type[RequestBody]] = {
+            "pty-req": PtyRequest,
+            "env": EnvRequest,
             "shell": ShellRequest,
             "exec": ExecRequest,
             "signal": SignalRequest,
@@ -1454,7 +1636,9 @@ class ProtocolTrace:
                 yield from self._field(item.name, field_value, indent)
 
     def _field(self, name: str, value: object, indent: str) -> Iterator[str]:
-        if isinstance(value, WireObject):
+        if isinstance(value, TerminalMode):
+            yield f"{indent}{name}: {value.description()}"
+        elif isinstance(value, WireObject):
             kind = type(value).__name__
             if isinstance(value, (AuthMethod, RequestBody)):
                 kind += f" ({value.name})"
@@ -2307,8 +2491,8 @@ class ServerSession:
             if request.signal in allowed and self.process.poll() is None:
                 os.killpg(self.process.pid, allowed[request.signal])
                 success = True
-        # OpaqueRequest bodies (pty-req, env, subsystem, etc.) are retained
-        # and explicitly rejected, never reported as successfully applied.
+        # PTY allocation, environment changes, and other unsupported requests
+        # are explicitly rejected, never reported as successfully applied.
         if packet.want_reply:
             self.channel.reply(success)
 

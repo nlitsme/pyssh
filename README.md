@@ -29,7 +29,7 @@ python -m pip install -r requirements.txt
 | Rekeying | Either peer can initiate; automatic local byte/time thresholds |
 | Host verification | Optional Ed25519 `.pub` pin; otherwise accept the presented key and warn |
 
-PTY allocation, SFTP/subsystems, forwarding, SSH-1, host certificates,
+PTY allocation, client-supplied environment changes, SFTP/subsystems, forwarding, SSH-1, host certificates,
 other cryptographic algorithms, and multiple concurrent session channels are
 not implemented. Unsupported requests are rejected rather than acknowledged
 as successful. A plain shell is available through `ssh -T` or by omitting the
@@ -88,7 +88,8 @@ an entire isolated object; they do not replace its reader/writer interface.
 There are 29 declared message types. Authentication-method fields live in
 `NoneAuth`, `PasswordAuth`, `PublicKeyAuth`, or `UnknownAuth`. Channel request
 fields live in `ShellRequest`, `ExecRequest`, `SignalRequest`,
-`ExitStatusRequest`, `ExitSignalRequest`, or `OpaqueRequest`.
+`ExitStatusRequest`, `ExitSignalRequest`, `PtyRequest`, `EnvRequest`, or
+`OpaqueRequest`.
 All use the same instance encode/decode interface. Unknown messages retain
 their complete body in `RawPacket`; unsupported method/request payloads remain
 explicitly opaque. `EncryptedData` denotes undecoded ciphertext.
@@ -100,6 +101,21 @@ decodes RSA, ECDSA, or Ed25519 parameters. Unknown key types retain their
 remaining bytes in `OpaquePublicKeyFields.undecoded`. This decodes the
 advertisements; it does not implement automatic host-key learning or proof
 responses, or change the algorithms accepted for authentication.
+
+`PtyRequest` decodes the terminal name, character/pixel dimensions, and the
+length-prefixed terminal modes. `TerminalModes` retains the ordered
+`TerminalMode` entries, including duplicates and the terminating opcode.
+Modes 1..159 carry a uint32 argument; unknown mode numbers retain that value.
+Opcode zero ends the list, and opcodes 160..255 stop further parsing.
+Any bytes after a stop opcode remain explicit in `undecoded` and round-trip
+unchanged. Empty mode strings are accepted; truncated arguments and nonempty
+lists without a stop opcode are rejected.
+
+Terminal names and `EnvRequest` variable/value strings retain their original
+bytes, including values that are not UTF-8. Tracing shows readable text and
+the full bytes. These classes provide decoding and encoding only: the server
+continues to reject PTY allocation and environment changes when a reply is
+requested, and does not apply them to commands.
 
 `HostKey`, `Signature`, `Hello`, `HybridInit`, and `HybridReply` also use this
 interface. Message types 30/31 have the same outer format for Curve25519 and
@@ -211,6 +227,10 @@ The timestamp appears once on the message header; decoded fields remain
 grouped underneath. Host-key advertisements include SHA-256 fingerprints,
 key sizes, RSA exponents and moduli, ECDSA curves and point coordinates,
 and Ed25519 public bytes. Unknown parameters remain explicitly undecoded.
+PTY requests show terminal dimensions and named modes such as `VINTR`,
+`ICANON`, `ECHO`, `IUTF8`, and input/output speeds. Control-character modes
+also show caret notation or `disabled`. Environment requests show the
+variable name and value as separate fields.
 
 Tracing goes to stderr, leaving command stdout unchanged. This is a full
 plaintext trace: passwords and channel contents are included. The default
@@ -256,8 +276,13 @@ python -m unittest datareader datawriter -v
 The additional host-key capture tests check all three advertised keys,
 exact round trips, malformed inputs, and fingerprints against `ssh-keygen`.
 Trace tests cover microsecond timestamp formatting at both verbosity levels.
+The PTY/environment captures check dimensions, mode parameters, environment
+strings, and exact round trips. Additional tests cover unknown modes,
+stop opcodes, retained undecoded tails, duplicate modes, binary strings,
+every truncated capture prefix, and continued rejection of unsupported
+PTY/environment operations.
 
-Validated here: **49 SSH tests plus 18 original helper tests**, all passing.
+Validated here: **57 SSH tests plus 18 original helper tests**, all passing.
 OpenSSH 10.0p2 independently verified both endpoints with both KEX methods;
 rekeys during live transfers and after authentication were also tested.
 OpenSSH-specific tests skip only when the relevant executable is absent.
@@ -295,6 +320,7 @@ are driven from one application thread; each connection has its own state.
 - [RFC 4252: user authentication](https://www.rfc-editor.org/rfc/rfc4252.html)
 - [RFC 4253: transport and key derivation](https://www.rfc-editor.org/rfc/rfc4253.html)
 - [RFC 4254: connection channels](https://www.rfc-editor.org/rfc/rfc4254.html)
+- [RFC 8160: IUTF8 terminal mode](https://www.rfc-editor.org/rfc/rfc8160.html)
 - [RFC 8731: Curve25519](https://www.rfc-editor.org/rfc/rfc8731.html)
 - [RFC 8709: Ed25519](https://www.rfc-editor.org/rfc/rfc8709.html)
 - [OpenSSH ML-KEM/X25519 implementation](https://github.com/openssh/openssh-portable/blob/master/kexmlkem768x25519.c)

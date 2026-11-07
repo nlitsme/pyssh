@@ -83,7 +83,9 @@ class WireInterfaceTests(unittest.TestCase):
             ssh.SignalRequest("INT"),
             ssh.ExitStatusRequest(7),
             ssh.ExitSignalRequest("TERM", False, "terminated", ""),
-            ssh.OpaqueRequest("pty-req", b"retained opaque body"),
+            ssh.PtyRequest(b"xterm-kitty", 190, 27, 1710, 486),
+            ssh.EnvRequest(b"COLORTERM", b"truecolor"),
+            ssh.OpaqueRequest("unknown@example.org", b"retained opaque body"),
         )
         for request in requests:
             packet = ssh.Msg98_ChannelRequest(3, request, False)
