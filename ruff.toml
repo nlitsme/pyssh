@@ -1,0 +1,12 @@
+# written by chatgpt GPT-6
+line-length = 160
+
+[format]
+skip-magic-trailing-comma = true
+
+[lint]
+select = ["E", "F", "I"]
+
+[lint.isort]
+split-on-trailing-comma = false
+known-first-party = ["datareader", "datawriter", "ssh"]

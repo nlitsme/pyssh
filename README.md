@@ -27,7 +27,7 @@ python -m pip install -r requirements.txt
 | Sessions | One non-PTY shell or exec channel per TCP connection |
 | Channel I/O | Binary stdin, stdout, stderr; EOF, exit status, window control |
 | Rekeying | Either peer can initiate; automatic local byte/time thresholds |
-| Host verification | Client requires an explicitly pinned Ed25519 `.pub` file |
+| Host verification | Optional Ed25519 `.pub` pin; otherwise accept the presented key and warn |
 
 PTY allocation, SFTP/subsystems, forwarding, SSH-1, host certificates,
 other cryptographic algorithms, and multiple concurrent session channels are
@@ -53,13 +53,49 @@ packets, then 364 encrypted server bytes and 68 encrypted client bytes.
 Those tails are retained exactly; the captured public values alone cannot
 recover their session keys, decrypt them, or verify the server's KEX signature.
 
-The decoder uses typed objects: `Hello`, `Msg20_KexInit`, `Msg21_NewKeys`,
-`Msg30_ECDHInit`, `Msg31_ECDHReply`, `HostKey`, and `Signature`. Message numbers
-30 and 31 have the same outer format for Curve25519 and the hybrid KEX.
-`HybridInit` and `HybridReply` split the hybrid blobs into ML-KEM and X25519
-components. Unknown messages retain their entire body in `RawPacket`;
-`EncryptedData` explicitly denotes undecoded ciphertext. Decoded frames retain
-all padding bytes and round-trip byte-for-byte.
+## Wire-object interface
+
+Every message and nested wire structure has the same instance methods:
+
+```python
+# written by chatgpt GPT-6
+from ssh import Msg5_ServiceRequest, SSHReader, SSHWriter
+
+packet = Msg5_ServiceRequest("ssh-userauth")
+writer = SSHWriter()
+packet.encode(writer)  # Message body fields, excluding the message-type byte.
+
+copy = Msg5_ServiceRequest()
+reader = SSHReader(writer.getvalue())
+copy.decode(reader)  # Populate this instance; returns None, like encode().
+reader.finish()
+```
+
+`SSHReader` and `SSHWriter` extend your `DataReader`/`DataWriter` classes.
+They retain `read32be`/`write32be` and add `readldata`/`writeldata`,
+`readlstr`/`writelstr`, and `readboolean`/`writeboolean`. SSH strings retain
+NULs; malformed text is rejected rather than silently discarded.
+
+`encode_message` writes the message-type byte followed by `packet.encode`.
+`decode_message` reads the type, creates the declared message class, and calls
+its instance `decode`. `SSH2Frame` owns the packet length, padding length,
+message envelope, and padding. Its encode/decode methods follow that order
+explicitly. `encode_object` and `decode_object` are convenience functions for
+an entire isolated object; they do not replace its reader/writer interface.
+`decode_object` also checks that no trailing bytes were left unconsumed.
+
+There are 29 declared message types. Authentication-method fields live in
+`NoneAuth`, `PasswordAuth`, `PublicKeyAuth`, or `UnknownAuth`. Channel request
+fields live in `ShellRequest`, `ExecRequest`, `SignalRequest`,
+`ExitStatusRequest`, `ExitSignalRequest`, or `OpaqueRequest`.
+All use the same instance encode/decode interface. Unknown messages retain
+their complete body in `RawPacket`; unsupported method/request payloads remain
+explicitly opaque. `EncryptedData` denotes undecoded ciphertext.
+
+`HostKey`, `Signature`, `Hello`, `HybridInit`, and `HybridReply` also use this
+interface. Message types 30/31 have the same outer format for Curve25519 and
+hybrid KEX; the hybrid structures split the ML-KEM and X25519 components.
+Captured frames retain all padding bytes and round-trip byte-for-byte.
 
 ## Password server and client
 
@@ -72,14 +108,13 @@ python ssh.py keygen host_ed25519
 Start a server (the password prompt uses `getpass`):
 
 ```sh
-python ssh.py server --host-key host_ed25519 --user testuser
+python ssh.py server -k host_ed25519 -u testuser
 ```
 
-In another terminal, use the matching public key obtained through a trusted
-route:
+In another terminal, connect without a pin (this emits the unverified-key warning):
 
 ```sh
-python ssh.py client --host-key host_ed25519.pub --user testuser \
+python ssh.py client -u testuser \
     127.0.0.1 'printf hello; printf error >&2; exit 7'
 ```
 
@@ -92,17 +127,36 @@ printf 'hello\n' | python ssh.py client --host-key host_ed25519.pub \
 ```
 
 Options must precede the host name; everything after the host is the remote
-shell command, matching the usual SSH convention. The default port is 2222;
-use `--port 22` for an ordinary OpenSSH server.
+shell command, matching the usual SSH convention. The default port is 22.
+Use `-p 2222` on both endpoints to choose another port.
 
-Use `--password-env VARIABLE_NAME` to read credentials from an existing
-environment variable instead of prompting. `--once` makes the server exit
-after one connection. `--listen ADDRESS` changes its bind address.
+Password lookup is `--password/-P` first, then the fixed `SSH_PASSWORD`
+environment variable, then a `getpass` prompt. No environment-variable name
+argument is needed. `--once/-o` exits after one connection and `--listen/-l`
+changes the server's bind address.
+
+A client host key is optional. With no `--host-key/-k`, the client accepts the
+presented key and emits a warning containing its SHA-256 fingerprint. It still
+verifies the key-exchange signature. Supplying a pin requires an exact match;
+a mismatch fails before user authentication.
+
+| Option | Short form | Default/meaning |
+| --- | --- | --- |
+| `--port` | `-p` | 22 |
+| `--user` | `-u` | Required SSH username |
+| `--password` | `-P` | Otherwise `SSH_PASSWORD`, then prompt |
+| `--host-key` | `-k` | Required private key for server; optional public pin for client |
+| `--identity` | `-i` | Client user private key |
+| `--authorized-key` | `-a` | Server's accepted user public key |
+| `--listen` | `-l` | Server bind address, default `127.0.0.1` |
+| `--once` | `-o` | Serve one connection |
+| `--curve25519` | `-c` | Disable hybrid ML-KEM |
+| `--timeout` | `-t` | Incomplete network-read timeout, default 30 seconds |
 
 An OpenSSH client can connect too:
 
 ```sh
-ssh -T -p 2222 -o PreferredAuthentications=password \
+ssh -T -o PreferredAuthentications=password \
     -o PubkeyAuthentication=no testuser@127.0.0.1 'printf hello'
 ```
 
@@ -112,7 +166,7 @@ Generate a separate user key (or use an existing Ed25519 private key):
 
 ```sh
 python ssh.py keygen user_ed25519
-python ssh.py server --host-key host_ed25519 --user testuser \
+python ssh.py server -k host_ed25519 -u testuser \
     --authorized-key user_ed25519.pub
 ```
 
@@ -124,7 +178,7 @@ python ssh.py client --host-key host_ed25519.pub --identity user_ed25519 \
 ```
 
 With `--authorized-key` alone, the server offers public-key authentication
-only. Add `--password-env VARIABLE_NAME` to enable both methods. The Python
+only. Add `--password/-P` or set `SSH_PASSWORD` to enable both methods. The Python
 client can authenticate to an OpenSSH server when its user public key is
 installed in that account's `authorized_keys`.
 
@@ -142,14 +196,14 @@ python -m unittest discover -s tests -v
 python -m unittest datareader datawriter -v
 ```
 
-Validated here: **24 SSH tests plus 18 original helper tests**, all passing.
+Validated here: **34 SSH tests plus 18 original helper tests**, all passing.
 OpenSSH 10.0p2 independently verified both endpoints with both KEX methods;
 rekeys during live transfers and after authentication were also tested.
 OpenSSH-specific tests skip only when the relevant executable is absent.
 The unprivileged `sshd -i` tests use temporary keys/configuration and the
 current OS account; they do not modify its password or SSH configuration.
 
-The new SSH code and tests pass Ruff's E/F/I checks at 79 columns; `ssh.py`
+The new SSH code and tests pass Ruff's E/F/I checks with a 160-column limit; `ssh.py`
 also passes mypy (`--follow-imports=silent`).
 
 ## Python API
@@ -162,7 +216,7 @@ from pathlib import Path
 from ssh import HostKey, SSHClient
 
 pinned = HostKey.from_public_file(Path("host_ed25519.pub"))
-with socket.create_connection(("127.0.0.1", 2222), timeout=30) as sock:
+with socket.create_connection(("127.0.0.1", 22), timeout=30) as sock:
     client = SSHClient(sock, pinned)
     client.authenticate("testuser", "password")
     result = client.run("cat", input_data=b"binary\x00data\n")

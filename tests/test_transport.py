@@ -6,8 +6,9 @@ import struct
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
-import ssh
 from cryptography.hazmat.primitives.asymmetric import ed25519
+
+import ssh
 
 
 class TransportTests(unittest.TestCase):
@@ -22,37 +23,29 @@ class TransportTests(unittest.TestCase):
 
     def test_cipher_authenticates_header_body_and_tag(self) -> None:
         cipher = ssh.ChaChaPoly(bytes(range(64)))
-        payload = ssh.Message(5).string("ssh-userauth").build().to_payload()
+        payload = ssh.encode_message(ssh.Msg5_ServiceRequest("ssh-userauth"))
         data = cipher.seal(7, payload)
-        self.assertEqual(cipher.open(7, data).packet.to_payload(), payload)
+        self.assertEqual(ssh.encode_message(cipher.open(7, data).packet), payload)
         for offset in (0, 4, 8, len(data) - 1):
             corrupted = bytearray(data)
             corrupted[offset] ^= 1
-            with (
-                self.subTest(offset=offset),
-                self.assertRaises(ssh.ProtocolError),
-            ):
+            with self.subTest(offset=offset), self.assertRaises(ssh.ProtocolError):
                 cipher.open(7, bytes(corrupted))
         with self.assertRaises(ssh.ProtocolError):
             cipher.open(8, data)
 
     def test_reject_malformed_plaintext_packets(self) -> None:
-        valid = ssh.SSH2Frame(ssh.Msg21_NewKeys(), bytes(10)).to_bytes()
-        for data in (
-            valid[:-1],
-            valid + b"\x00",
-            valid[:4] + b"\x03" + valid[5:],
-            struct.pack(">I", ssh.MAX_PACKET + 1) + valid[4:],
-        ):
+        valid = ssh.encode_object(ssh.SSH2Frame(ssh.Msg21_NewKeys(), bytes(10)))
+        for data in (valid[:-1], valid + b"\x00", valid[:4] + b"\x03" + valid[5:], struct.pack(">I", ssh.MAX_PACKET + 1) + valid[4:]):
             with self.subTest(data=data), self.assertRaises(ssh.ProtocolError):
-                ssh.SSH2Frame.from_bytes(data)
+                ssh.decode_object(ssh.SSH2Frame(), data)
 
     def test_no_silent_trailing_bytes(self) -> None:
         with self.assertRaises(ssh.ProtocolError):
-            ssh.SshPacket.from_payload(b"\x15\x00")
-        raw = ssh.SshPacket.from_payload(b"\xfeunknown")
+            ssh.decode_message(ssh.SSHReader(b"\x15\x00"))
+        raw = ssh.decode_message(ssh.SSHReader(b"\xfeunknown"))
         self.assertIsInstance(raw, ssh.RawPacket)
-        self.assertEqual(raw.to_payload(), b"\xfeunknown")
+        self.assertEqual(ssh.encode_message(raw), b"\xfeunknown")
 
     def test_both_kex_methods_and_rekey(self) -> None:
         for curve_only in (False, True):
@@ -61,25 +54,19 @@ class TransportTests(unittest.TestCase):
 
     def check_exchange(self, curve_only: bool) -> None:
         host = ed25519.Ed25519PrivateKey.generate()
-        pinned = ssh.HostKey(
-            "ssh-ed25519", host.public_key().public_bytes_raw()
-        )
+        pinned = ssh.HostKey("ssh-ed25519", host.public_key().public_bytes_raw())
         left, right = socket.socketpair()
         left.settimeout(5)
         right.settimeout(5)
         with left, right, ThreadPoolExecutor(max_workers=1) as pool:
-            pending = pool.submit(
-                ssh.Connection, left, True, host, None, curve_only
-            )
-            client = ssh.Connection(
-                right, pinned_key=pinned, curve_only=curve_only
-            )
+            pending = pool.submit(ssh.Connection, left, True, host, None, curve_only)
+            client = ssh.Connection(right, pinned_key=pinned, curve_only=curve_only)
             server = pending.result(timeout=5)
             self.assertEqual(client.session_id, server.session_id)
             self.assertEqual(client.transport.send_sequence, 0)
             self.assertEqual(server.transport.recv_sequence, 0)
             original_session = client.session_id
-            client.send(ssh.Message(5).string("ssh-userauth").build())
+            client.send(ssh.Msg5_ServiceRequest("ssh-userauth"))
             self.assertEqual(server.expect(5).msgtype, 5)
             pending_rekey = pool.submit(client.key_exchange)
             # receive() handles the rekey, then waits for application data.
@@ -88,7 +75,7 @@ class TransportTests(unittest.TestCase):
             pending_rekey.result(timeout=5)
             self.assertEqual(client.session_id, original_session)
             self.assertEqual(server.session_id, original_session)
-            server.send(ssh.Message(6).string("ssh-userauth").build())
+            server.send(ssh.Msg6_ServiceAccept("ssh-userauth"))
             self.assertEqual(client.expect(6).msgtype, 6)
 
 

@@ -18,23 +18,24 @@ import os
 import select
 import signal
 import socket
-import struct
 import subprocess
 import sys
 import threading
 import time
+import warnings
 from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import IO, BinaryIO, ClassVar
+from typing import IO, BinaryIO, ClassVar, TypeVar
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, mlkem, x25519
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 from cryptography.hazmat.primitives.poly1305 import Poly1305
-from datareader import BaseReader, DataReader
-from datawriter import BaseWriter, DataWriter
+
+from datareader import DataReader
+from datawriter import DataWriter
 
 MAX_PACKET = 256 * 1024
 CHANNEL_PACKET = 32768
@@ -61,9 +62,7 @@ def roundup(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
-def padding_size(
-    payload_size: int, block_size: int = 8, header_size: int = 5
-) -> int:
+def padding_size(payload_size: int, block_size: int = 8, header_size: int = 5) -> int:
     """Include the message type in payload_size; ChaCha uses header_size=1."""
     if payload_size < 1 or block_size < 8 or block_size > 128:
         raise ValueError("invalid payload size or block size")
@@ -71,173 +70,223 @@ def padding_size(
     return padding if padding >= 4 else padding + block_size
 
 
-def writeldata(writer: BaseWriter, data: bytes) -> None:
-    writer.write32be(len(data))
-    if data:
-        writer.write(data)
+class SSHReader(DataReader):
+    """The supplied reader, extended with SSH's length-prefixed values."""
 
+    def readldata(self) -> bytes:
+        length = self.read32be()
+        if length > MAX_PACKET:
+            raise ProtocolError(f"SSH string too long: {length}")
+        return self.read(length)
 
-def writelstr(writer: BaseWriter, text: str) -> None:
-    writeldata(writer, text.encode("utf-8"))
+    def readlstr(self, encoding: str = "utf-8") -> str:
+        return self.readldata().decode(encoding)
 
-
-def readldata(reader: BaseReader) -> bytes:
-    size = reader.read32be()
-    if size > MAX_PACKET:
-        raise ProtocolError(f"SSH string too long: {size}")
-    return reader.read(size)
-
-
-def readlstr(reader: BaseReader) -> str:
-    # Deliberately do not use readstr(): SSH strings retain NULs and must
-    # reject malformed UTF-8, rather than silently skipping undecoded bytes.
-    return readldata(reader).decode("utf-8")
-
-
-def require_end(reader: DataReader) -> None:
-    if reader.remaining():
-        raise ProtocolError(f"{reader.remaining()} unexpected trailing bytes")
-
-
-@dataclass
-class Hello:
-    version: str = VERSION
-    ending: bytes = b"\r\n"
-
-    def __post_init__(self) -> None:
-        if "\r" in self.version or "\n" in self.version:
-            raise ProtocolError("newline in identification")
-        parts = self.version.split("-", 2)
-        if len(parts) != 3 or parts[0] != "SSH":
-            raise ProtocolError("invalid SSH identification")
-        if parts[1] not in ("2.0", "1.99"):
-            raise ProtocolError("only SSH-2 is supported")
-        software = parts[2].split(" ", 1)[0]
-        if not software or any(
-            ord(c) < 33 or ord(c) > 126 or c == "-" for c in software
-        ):
-            raise ProtocolError("invalid software identifier")
-        if self.ending not in (b"\n", b"\r\n"):
-            raise ProtocolError("invalid identification terminator")
-        if len(self.to_bytes()) > 255:
-            raise ProtocolError("identification exceeds 255 bytes")
-
-    @classmethod
-    def from_bytes(cls, line: bytes) -> Hello:
-        if not line.endswith(b"\n"):
-            raise ProtocolError("unterminated identification")
-        ending = b"\r\n" if line.endswith(b"\r\n") else b"\n"
-        return cls(line[: -len(ending)].decode("ascii"), ending)
-
-    def to_bytes(self) -> bytes:
-        return self.version.encode("ascii") + self.ending
-
-    def encode(self, writer: BaseWriter) -> None:
-        writer.write(self.to_bytes())
-
-
-class SshPacket:
-    msgtype: int
-
-    def encode(self, writer: BaseWriter) -> None:
-        raise NotImplementedError
-
-    def to_payload(self) -> bytes:
-        writer = DataWriter()
-        writer.writebyte(self.msgtype)
-        self.encode(writer)
-        return writer.getvalue()
-
-    @staticmethod
-    def decode(msgtype: int, body: bytes) -> SshPacket:
-        reader = DataReader(body)
-        if msgtype == 20:
-            packet: SshPacket = Msg20_KexInit.from_reader(reader)
-        elif msgtype == 21:
-            packet = Msg21_NewKeys()
-        elif msgtype == 30:
-            packet = Msg30_ECDHInit(readldata(reader))
-        elif msgtype == 31:
-            packet = Msg31_ECDHReply.from_reader(reader)
-        else:
-            # Unknown/connection messages remain explicitly opaque, lossless
-            # RawPackets until consumed by their state-specific parser.
-            return RawPacket(msgtype, body)
-        require_end(reader)
-        return packet
-
-    @staticmethod
-    def from_payload(payload: bytes) -> SshPacket:
-        if not payload:
-            raise ProtocolError("empty SSH payload")
-        return SshPacket.decode(payload[0], payload[1:])
-
-
-@dataclass
-class RawPacket(SshPacket):
-    msgtype: int
-    body: bytes = b""
-
-    def encode(self, writer: BaseWriter) -> None:
-        if self.body:
-            writer.write(self.body)
-
-
-class Message:
-    """Typed builder for state-specific SSH messages."""
-
-    def __init__(self, msgtype: int):
-        self.msgtype = msgtype
-        self.writer = DataWriter()
-
-    def u32(self, value: int) -> Message:
-        self.writer.write32be(value)
-        return self
-
-    def boolean(self, value: bool) -> Message:
-        self.writer.writebyte(int(value))
-        return self
-
-    def string(self, value: bytes | str) -> Message:
-        data = value.encode("utf-8") if isinstance(value, str) else value
-        writeldata(self.writer, data)
-        return self
-
-    def raw(self, value: bytes) -> Message:
-        if value:
-            self.writer.write(value)
-        return self
-
-    def build(self) -> RawPacket:
-        return RawPacket(self.msgtype, self.writer.getvalue())
-
-
-class MessageReader(DataReader):
-    def __init__(self, packet: SshPacket):
-        super().__init__(packet.to_payload()[1:])
-
-    def string(self) -> bytes:
-        return readldata(self)
-
-    def text(self) -> str:
-        return readlstr(self)
-
-    def u32(self) -> int:
-        return self.read32be()
-
-    def boolean(self) -> bool:
+    def readboolean(self) -> bool:
         value = self.readbyte()
         if value not in (0, 1):
             raise ProtocolError("noncanonical boolean")
         return bool(value)
 
-    def end(self) -> None:
-        require_end(self)
+    def finish(self) -> None:
+        if self.remaining():
+            raise ProtocolError(f"{self.remaining()} unexpected trailing bytes")
+
+
+class SSHWriter(DataWriter):
+    """The supplied writer, extended with SSH's length-prefixed values."""
+
+    def write(self, data: bytes) -> None:
+        # The supplied DataWriter grows by one byte on an empty write.
+        if data:
+            super().write(data)
+
+    def writeldata(self, data: bytes) -> None:
+        self.write32be(len(data))
+        self.write(data)
+
+    def writelstr(self, text: str, encoding: str = "utf-8") -> None:
+        self.writeldata(text.encode(encoding))
+
+    def writeboolean(self, value: bool) -> None:
+        self.writebyte(int(value))
+
+
+class WireObject:
+    """All wire objects encode into and decode from a reader/writer instance."""
+
+    def encode(self, writer: SSHWriter) -> None:
+        raise NotImplementedError
+
+    def decode(self, reader: SSHReader) -> None:
+        raise NotImplementedError
+
+
+WireType = TypeVar("WireType", bound=WireObject)
+
+
+def encode_object(value: WireObject) -> bytes:
+    writer = SSHWriter()
+    value.encode(writer)
+    return writer.getvalue()
+
+
+def decode_object(value: WireType, data: bytes) -> WireType:
+    reader = SSHReader(data)
+    value.decode(reader)
+    reader.finish()
+    return value
+
+
+@dataclass
+class Hello(WireObject):
+    version: str = VERSION
+    ending: bytes = b"\r\n"
+
+    def validate(self) -> None:
+        if "\r" in self.version or "\n" in self.version:
+            raise ProtocolError("newline in identification")
+        parts = self.version.split("-", 2)
+        if len(parts) != 3 or parts[0] != "SSH" or parts[1] not in ("2.0", "1.99"):
+            raise ProtocolError("invalid SSH-2 identification")
+        software = parts[2].split(" ", 1)[0]
+        if not software or any(ord(c) < 33 or ord(c) > 126 or c == "-" for c in software):
+            raise ProtocolError("invalid software identifier")
+        if self.ending not in (b"\n", b"\r\n"):
+            raise ProtocolError("invalid identification terminator")
+        if len(self.version.encode("ascii")) + len(self.ending) > 255:
+            raise ProtocolError("identification exceeds 255 bytes")
+
+    def encode(self, writer: SSHWriter) -> None:
+        self.validate()
+        writer.writestr(self.version, "ascii")
+        writer.write(self.ending)
+
+    def decode(self, reader: SSHReader) -> None:
+        line = reader.readline()
+        if not line.endswith("\n"):
+            raise ProtocolError("unterminated identification")
+        self.ending = b"\r\n" if line.endswith("\r\n") else b"\n"
+        self.version = line[: -len(self.ending)]
+        self.validate()
+
+
+class SshPacket(WireObject):
+    """encode/decode handle the body; the envelope owns the message-type byte."""
+
+    @property
+    def msgtype(self) -> int:
+        raise NotImplementedError
+
+
+class EmptyMessage(SshPacket):
+    def encode(self, writer: SSHWriter) -> None:
+        pass
+
+    def decode(self, reader: SSHReader) -> None:
+        pass
+
+
+@dataclass
+class RawPacket(SshPacket):
+    """An unknown message type; its complete body remains explicitly opaque."""
+
+    type_code: int = 0
+    body: bytes = b""
+
+    @property
+    def msgtype(self) -> int:
+        return self.type_code
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write(self.body)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.body = reader.read(reader.remaining())
+
+
+@dataclass
+class Msg1_Disconnect(SshPacket):
+    msgtype: ClassVar[int] = 1
+    reason: int = 0
+    description: str = ""
+    language: str = ""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.reason)
+        writer.writelstr(self.description)
+        writer.writelstr(self.language)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.reason = reader.read32be()
+        self.description = reader.readlstr()
+        self.language = reader.readlstr()
+
+
+@dataclass
+class Msg2_Ignore(SshPacket):
+    msgtype: ClassVar[int] = 2
+    data: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writeldata(self.data)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.data = reader.readldata()
+
+
+@dataclass
+class Msg3_Unimplemented(SshPacket):
+    msgtype: ClassVar[int] = 3
+    sequence: int = 0
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.sequence)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.sequence = reader.read32be()
+
+
+@dataclass
+class Msg4_Debug(SshPacket):
+    msgtype: ClassVar[int] = 4
+    always_display: bool = False
+    message: str = ""
+    language: str = ""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writeboolean(self.always_display)
+        writer.writelstr(self.message)
+        writer.writelstr(self.language)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.always_display = reader.readboolean()
+        self.message = reader.readlstr()
+        self.language = reader.readlstr()
+
+
+@dataclass
+class ServiceMessage(SshPacket):
+    service: str = "ssh-userauth"
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.service)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.service = reader.readlstr()
+
+
+class Msg5_ServiceRequest(ServiceMessage):
+    msgtype: ClassVar[int] = 5
+
+
+class Msg6_ServiceAccept(ServiceMessage):
+    msgtype: ClassVar[int] = 6
 
 
 @dataclass
 class Msg20_KexInit(SshPacket):
-    msgtype: int = field(default=20, init=False)
+    msgtype: ClassVar[int] = 20
     cookie: bytes = field(default_factory=lambda: os.urandom(16))
     kex_algorithms: str = KEX_HYBRID + "," + KEX_CURVE
     hostkey_algorithms: str = "ssh-ed25519"
@@ -264,30 +313,41 @@ class Msg20_KexInit(SshPacket):
         "s2c_lang",
     )
 
-    def encode(self, writer: BaseWriter) -> None:
+    def encode(self, writer: SSHWriter) -> None:
         if len(self.cookie) != 16:
             raise ProtocolError("KEXINIT cookie must have 16 bytes")
         writer.write(self.cookie)
-        for name in self.list_fields:
-            value: str = getattr(self, name)
-            writeldata(writer, value.encode("ascii"))
-        writer.writebyte(int(self.kexfollows))
+        writer.writelstr(self.kex_algorithms, "ascii")
+        writer.writelstr(self.hostkey_algorithms, "ascii")
+        writer.writelstr(self.c2s_encryption, "ascii")
+        writer.writelstr(self.s2c_encryption, "ascii")
+        writer.writelstr(self.c2s_mac, "ascii")
+        writer.writelstr(self.s2c_mac, "ascii")
+        writer.writelstr(self.c2s_comp, "ascii")
+        writer.writelstr(self.s2c_comp, "ascii")
+        writer.writelstr(self.c2s_lang, "ascii")
+        writer.writelstr(self.s2c_lang, "ascii")
+        writer.writeboolean(self.kexfollows)
         writer.write32be(self.reserved)
 
-    @classmethod
-    def from_reader(cls, reader: DataReader) -> Msg20_KexInit:
-        result = cls(cookie=reader.read(16))
-        for name in cls.list_fields:
-            value = readldata(reader).decode("ascii")
-            if value and any(
-                not item or any(ord(c) < 33 or ord(c) > 126 for c in item)
-                for item in value.split(",")
-            ):
+    def decode(self, reader: SSHReader) -> None:
+        self.cookie = reader.read(16)
+        self.kex_algorithms = reader.readlstr("ascii")
+        self.hostkey_algorithms = reader.readlstr("ascii")
+        self.c2s_encryption = reader.readlstr("ascii")
+        self.s2c_encryption = reader.readlstr("ascii")
+        self.c2s_mac = reader.readlstr("ascii")
+        self.s2c_mac = reader.readlstr("ascii")
+        self.c2s_comp = reader.readlstr("ascii")
+        self.s2c_comp = reader.readlstr("ascii")
+        self.c2s_lang = reader.readlstr("ascii")
+        self.s2c_lang = reader.readlstr("ascii")
+        self.kexfollows = reader.readboolean()
+        self.reserved = reader.read32be()
+        for name in self.list_fields:
+            value: str = getattr(self, name)
+            if value and any(not item or any(ord(c) < 33 or ord(c) > 126 for c in item) for item in value.split(",")):
                 raise ProtocolError("malformed algorithm name-list")
-            setattr(result, name, value)
-        result.kexfollows = bool(reader.readbyte())
-        result.reserved = reader.read32be()
-        return result
 
     @classmethod
     def proposal(cls, server: bool, curve_only: bool = False) -> Msg20_KexInit:
@@ -299,51 +359,45 @@ class Msg20_KexInit(SshPacket):
         return result
 
 
-@dataclass
-class Msg21_NewKeys(SshPacket):
-    msgtype: int = field(default=21, init=False)
-
-    def encode(self, writer: BaseWriter) -> None:
-        pass
+class Msg21_NewKeys(EmptyMessage):
+    msgtype: ClassVar[int] = 21
 
 
 @dataclass
 class Msg30_ECDHInit(SshPacket):
     """Also the outer format of SSH_MSG_KEX_HYBRID_INIT."""
 
-    msgtype: int = field(default=30, init=False)
+    msgtype: ClassVar[int] = 30
     pubkey: bytes = b""
 
-    def encode(self, writer: BaseWriter) -> None:
-        writeldata(writer, self.pubkey)
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writeldata(self.pubkey)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.pubkey = reader.readldata()
 
 
 @dataclass
-class HostKey:
-    algorithm: str
-    key: bytes
+class HostKey(WireObject):
+    algorithm: str = "ssh-ed25519"
+    key: bytes = b""
 
-    def to_bytes(self) -> bytes:
-        return Message(0).string(self.algorithm).string(self.key).build().body
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.algorithm)
+        writer.writeldata(self.key)
 
-    def encode(self, writer: BaseWriter) -> None:
-        writer.write(self.to_bytes())
-
-    @classmethod
-    def from_bytes(cls, data: bytes) -> HostKey:
-        reader = DataReader(data)
-        result = cls(readlstr(reader), readldata(reader))
-        require_end(reader)
-        if result.algorithm != "ssh-ed25519" or len(result.key) != 32:
+    def decode(self, reader: SSHReader) -> None:
+        self.algorithm = reader.readlstr()
+        self.key = reader.readldata()
+        if self.algorithm != "ssh-ed25519" or len(self.key) != 32:
             raise ProtocolError("only 32-byte ssh-ed25519 host keys supported")
-        return result
 
     def fingerprint(self) -> str:
-        digest = hashlib.sha256(self.to_bytes()).digest()
+        digest = hashlib.sha256(encode_object(self)).digest()
         return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
 
     def openssh(self) -> bytes:
-        return b"ssh-ed25519 " + base64.b64encode(self.to_bytes())
+        return b"ssh-ed25519 " + base64.b64encode(encode_object(self))
 
     @classmethod
     def from_public_file(cls, path: Path) -> HostKey:
@@ -354,71 +408,647 @@ class HostKey:
 
 
 @dataclass
-class Signature:
-    algorithm: str
-    data: bytes
+class Signature(WireObject):
+    algorithm: str = "ssh-ed25519"
+    data: bytes = b""
 
-    def to_bytes(self) -> bytes:
-        return Message(0).string(self.algorithm).string(self.data).build().body
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.algorithm)
+        writer.writeldata(self.data)
 
-    def encode(self, writer: BaseWriter) -> None:
-        writer.write(self.to_bytes())
+    def decode(self, reader: SSHReader) -> None:
+        self.algorithm = reader.readlstr()
+        self.data = reader.readldata()
 
-    @classmethod
-    def from_bytes(cls, data: bytes) -> Signature:
-        reader = DataReader(data)
-        result = cls(readlstr(reader), readldata(reader))
-        require_end(reader)
-        if result.algorithm != "ssh-ed25519" or len(result.data) != 64:
+    def require_ed25519(self) -> None:
+        if self.algorithm != "ssh-ed25519" or len(self.data) != 64:
             raise ProtocolError("invalid Ed25519 signature blob")
-        return result
 
 
 @dataclass
 class Msg31_ECDHReply(SshPacket):
-    """Also the outer format of SSH_MSG_KEX_HYBRID_REPLY."""
+    """Three SSH strings; the host-key and signature strings have inner fields."""
 
-    msgtype: int = field(default=31, init=False)
-    hostkey: HostKey
-    pubkey: bytes
-    signature: Signature
+    msgtype: ClassVar[int] = 31
+    hostkey: HostKey = field(default_factory=HostKey)
+    pubkey: bytes = b""
+    signature: Signature = field(default_factory=Signature)
 
-    def encode(self, writer: BaseWriter) -> None:
-        writeldata(writer, self.hostkey.to_bytes())
-        writeldata(writer, self.pubkey)
-        writeldata(writer, self.signature.to_bytes())
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writeldata(encode_object(self.hostkey))
+        writer.writeldata(self.pubkey)
+        writer.writeldata(encode_object(self.signature))
 
-    @classmethod
-    def from_reader(cls, reader: DataReader) -> Msg31_ECDHReply:
-        return cls(
-            HostKey.from_bytes(readldata(reader)),
-            readldata(reader),
-            Signature.from_bytes(readldata(reader)),
-        )
+    def decode(self, reader: SSHReader) -> None:
+        self.hostkey = decode_object(HostKey(), reader.readldata())
+        self.pubkey = reader.readldata()
+        self.signature = decode_object(Signature(), reader.readldata())
+        self.signature.require_ed25519()
 
 
-@dataclass(frozen=True)
-class HybridInit:
-    kem_public: bytes
-    x25519_public: bytes
+@dataclass
+class HybridInit(WireObject):
+    kem_public: bytes = b""
+    x25519_public: bytes = b""
 
-    @classmethod
-    def decode(cls, data: bytes) -> HybridInit:
-        if len(data) != 1216:
-            raise ProtocolError("hybrid client key must contain 1216 bytes")
-        return cls(data[:1184], data[1184:])
+    def encode(self, writer: SSHWriter) -> None:
+        if len(self.kem_public) != 1184 or len(self.x25519_public) != 32:
+            raise ProtocolError("invalid hybrid client key lengths")
+        writer.write(self.kem_public)
+        writer.write(self.x25519_public)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.kem_public = reader.read(1184)
+        self.x25519_public = reader.read(32)
 
 
-@dataclass(frozen=True)
-class HybridReply:
-    kem_ciphertext: bytes
-    x25519_public: bytes
+@dataclass
+class HybridReply(WireObject):
+    kem_ciphertext: bytes = b""
+    x25519_public: bytes = b""
 
-    @classmethod
-    def decode(cls, data: bytes) -> HybridReply:
-        if len(data) != 1120:
-            raise ProtocolError("hybrid server reply must contain 1120 bytes")
-        return cls(data[:1088], data[1088:])
+    def encode(self, writer: SSHWriter) -> None:
+        if len(self.kem_ciphertext) != 1088 or len(self.x25519_public) != 32:
+            raise ProtocolError("invalid hybrid server key lengths")
+        writer.write(self.kem_ciphertext)
+        writer.write(self.x25519_public)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.kem_ciphertext = reader.read(1088)
+        self.x25519_public = reader.read(32)
+
+
+class AuthMethod(WireObject):
+    @property
+    def name(self) -> str:
+        raise NotImplementedError
+
+
+class NoneAuth(AuthMethod):
+    name = "none"
+
+    def encode(self, writer: SSHWriter) -> None:
+        pass
+
+    def decode(self, reader: SSHReader) -> None:
+        pass
+
+
+@dataclass
+class PasswordAuth(AuthMethod):
+    name: ClassVar[str] = "password"
+    change: bool = False
+    password: bytes = field(default=b"", repr=False)
+    new_password: bytes = field(default=b"", repr=False)
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writeboolean(self.change)
+        writer.writeldata(self.password)
+        if self.change:
+            writer.writeldata(self.new_password)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.change = reader.readboolean()
+        self.password = reader.readldata()
+        self.new_password = reader.readldata() if self.change else b""
+
+
+@dataclass
+class PublicKeyAuth(AuthMethod):
+    name: ClassVar[str] = "publickey"
+    signed: bool = False
+    algorithm: str = "ssh-ed25519"
+    public_key: bytes = b""
+    signature: Signature | None = None
+
+    def encode_fields(self, writer: SSHWriter) -> None:
+        writer.writeboolean(self.signed)
+        writer.writelstr(self.algorithm)
+        writer.writeldata(self.public_key)
+
+    def encode(self, writer: SSHWriter) -> None:
+        self.encode_fields(writer)
+        if self.signed:
+            if self.signature is None:
+                raise ProtocolError("signed public-key request needs a signature")
+            writer.writeldata(encode_object(self.signature))
+
+    def decode(self, reader: SSHReader) -> None:
+        self.signed = reader.readboolean()
+        self.algorithm = reader.readlstr()
+        self.public_key = reader.readldata()
+        self.signature = decode_object(Signature(), reader.readldata()) if self.signed else None
+
+
+@dataclass
+class UnknownAuth(AuthMethod):
+    """Unsupported method-specific fields are preserved and rejected."""
+
+    name: str = ""
+    data: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write(self.data)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.data = reader.read(reader.remaining())
+
+
+@dataclass
+class Msg50_UserAuthRequest(SshPacket):
+    msgtype: ClassVar[int] = 50
+    username: str = ""
+    service: str = "ssh-connection"
+    method: AuthMethod = field(default_factory=NoneAuth)
+
+    def encode_header(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.username)
+        writer.writelstr(self.service)
+        writer.writelstr(self.method.name)
+
+    def encode(self, writer: SSHWriter) -> None:
+        self.encode_header(writer)
+        self.method.encode(writer)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.username = reader.readlstr()
+        self.service = reader.readlstr()
+        name = reader.readlstr()
+        methods: dict[str, type[AuthMethod]] = {"none": NoneAuth, "password": PasswordAuth, "publickey": PublicKeyAuth}
+        self.method = methods[name]() if name in methods else UnknownAuth(name)
+        self.method.decode(reader)
+
+    def signature_input(self, session_id: bytes) -> bytes:
+        if not isinstance(self.method, PublicKeyAuth) or not self.method.signed:
+            raise ProtocolError("signature input requires a signed public-key request")
+        writer = SSHWriter()
+        writer.writeldata(session_id)
+        writer.writebyte(self.msgtype)
+        self.encode_header(writer)
+        self.method.encode_fields(writer)
+        return writer.getvalue()
+
+
+@dataclass
+class Msg51_UserAuthFailure(SshPacket):
+    msgtype: ClassVar[int] = 51
+    methods: str = ""
+    partial: bool = False
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.methods)
+        writer.writeboolean(self.partial)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.methods = reader.readlstr()
+        self.partial = reader.readboolean()
+
+
+class Msg52_UserAuthSuccess(EmptyMessage):
+    msgtype: ClassVar[int] = 52
+
+
+@dataclass
+class Msg53_UserAuthBanner(SshPacket):
+    msgtype: ClassVar[int] = 53
+    message: str = ""
+    language: str = ""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.message)
+        writer.writelstr(self.language)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.message = reader.readlstr()
+        self.language = reader.readlstr()
+
+
+@dataclass
+class Msg60_UserAuthPKOK(SshPacket):
+    msgtype: ClassVar[int] = 60
+    algorithm: str = "ssh-ed25519"
+    public_key: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.algorithm)
+        writer.writeldata(self.public_key)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.algorithm = reader.readlstr()
+        self.public_key = reader.readldata()
+
+
+@dataclass
+class Msg80_GlobalRequest(SshPacket):
+    """The request-specific payload is unsupported and remains opaque."""
+
+    msgtype: ClassVar[int] = 80
+    name: str = ""
+    want_reply: bool = False
+    data: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.name)
+        writer.writeboolean(self.want_reply)
+        writer.write(self.data)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.name = reader.readlstr()
+        self.want_reply = reader.readboolean()
+        self.data = reader.read(reader.remaining())
+
+
+@dataclass
+class Msg81_RequestSuccess(SshPacket):
+    """Success data depends on the originating global request; retained opaque."""
+
+    msgtype: ClassVar[int] = 81
+    data: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write(self.data)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.data = reader.read(reader.remaining())
+
+
+class Msg82_RequestFailure(EmptyMessage):
+    msgtype: ClassVar[int] = 82
+
+
+@dataclass
+class Msg90_ChannelOpen(SshPacket):
+    msgtype: ClassVar[int] = 90
+    channel_type: str = "session"
+    sender: int = 0
+    window: int = CHANNEL_WINDOW
+    max_packet: int = CHANNEL_PACKET
+    extra: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.channel_type)
+        writer.write32be(self.sender)
+        writer.write32be(self.window)
+        writer.write32be(self.max_packet)
+        writer.write(self.extra)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.channel_type = reader.readlstr()
+        self.sender = reader.read32be()
+        self.window = reader.read32be()
+        self.max_packet = reader.read32be()
+        self.extra = reader.read(reader.remaining())
+        if self.channel_type == "session" and self.extra:
+            raise ProtocolError("unexpected session channel-open data")
+
+
+@dataclass
+class Msg91_ChannelOpenConfirmation(SshPacket):
+    msgtype: ClassVar[int] = 91
+    recipient: int = 0
+    sender: int = 0
+    window: int = CHANNEL_WINDOW
+    max_packet: int = CHANNEL_PACKET
+    extra: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.recipient)
+        writer.write32be(self.sender)
+        writer.write32be(self.window)
+        writer.write32be(self.max_packet)
+        writer.write(self.extra)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.recipient = reader.read32be()
+        self.sender = reader.read32be()
+        self.window = reader.read32be()
+        self.max_packet = reader.read32be()
+        self.extra = reader.read(reader.remaining())
+
+
+@dataclass
+class Msg92_ChannelOpenFailure(SshPacket):
+    msgtype: ClassVar[int] = 92
+    recipient: int = 0
+    reason: int = 1
+    description: str = ""
+    language: str = ""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.recipient)
+        writer.write32be(self.reason)
+        writer.writelstr(self.description)
+        writer.writelstr(self.language)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.recipient = reader.read32be()
+        self.reason = reader.read32be()
+        self.description = reader.readlstr()
+        self.language = reader.readlstr()
+
+
+class ChannelMessage(SshPacket):
+    recipient: int
+
+
+@dataclass
+class Msg93_ChannelWindowAdjust(ChannelMessage):
+    msgtype: ClassVar[int] = 93
+    recipient: int = 0
+    adjustment: int = 0
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.recipient)
+        writer.write32be(self.adjustment)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.recipient = reader.read32be()
+        self.adjustment = reader.read32be()
+
+
+@dataclass
+class Msg94_ChannelData(ChannelMessage):
+    msgtype: ClassVar[int] = 94
+    recipient: int = 0
+    data: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.recipient)
+        writer.writeldata(self.data)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.recipient = reader.read32be()
+        self.data = reader.readldata()
+
+
+@dataclass
+class Msg95_ChannelExtendedData(ChannelMessage):
+    msgtype: ClassVar[int] = 95
+    recipient: int = 0
+    stream: int = 1
+    data: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.recipient)
+        writer.write32be(self.stream)
+        writer.writeldata(self.data)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.recipient = reader.read32be()
+        self.stream = reader.read32be()
+        self.data = reader.readldata()
+
+
+@dataclass
+class RecipientMessage(ChannelMessage):
+    recipient: int = 0
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.recipient)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.recipient = reader.read32be()
+
+
+class Msg96_ChannelEOF(RecipientMessage):
+    msgtype: ClassVar[int] = 96
+
+
+class Msg97_ChannelClose(RecipientMessage):
+    msgtype: ClassVar[int] = 97
+
+
+class RequestBody(WireObject):
+    @property
+    def name(self) -> str:
+        raise NotImplementedError
+
+
+class ShellRequest(RequestBody):
+    name = "shell"
+
+    def encode(self, writer: SSHWriter) -> None:
+        pass
+
+    def decode(self, reader: SSHReader) -> None:
+        pass
+
+
+@dataclass
+class ExecRequest(RequestBody):
+    name: ClassVar[str] = "exec"
+    command: str = ""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.command)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.command = reader.readlstr()
+
+
+@dataclass
+class SignalRequest(RequestBody):
+    name: ClassVar[str] = "signal"
+    signal: str = ""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.signal)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.signal = reader.readlstr()
+
+
+@dataclass
+class ExitStatusRequest(RequestBody):
+    name: ClassVar[str] = "exit-status"
+    status: int = 0
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.status)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.status = reader.read32be()
+
+
+@dataclass
+class ExitSignalRequest(RequestBody):
+    name: ClassVar[str] = "exit-signal"
+    signal: str = ""
+    core_dumped: bool = False
+    description: str = ""
+    language: str = ""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.writelstr(self.signal)
+        writer.writeboolean(self.core_dumped)
+        writer.writelstr(self.description)
+        writer.writelstr(self.language)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.signal = reader.readlstr()
+        self.core_dumped = reader.readboolean()
+        self.description = reader.readlstr()
+        self.language = reader.readlstr()
+
+
+@dataclass
+class OpaqueRequest(RequestBody):
+    """Unsupported request-specific fields, retained for explicit rejection."""
+
+    name: str = ""
+    data: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write(self.data)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.data = reader.read(reader.remaining())
+
+
+@dataclass
+class Msg98_ChannelRequest(ChannelMessage):
+    msgtype: ClassVar[int] = 98
+    recipient: int = 0
+    request: RequestBody = field(default_factory=ShellRequest)
+    want_reply: bool = True
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write32be(self.recipient)
+        writer.writelstr(self.request.name)
+        writer.writeboolean(self.want_reply)
+        self.request.encode(writer)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.recipient = reader.read32be()
+        name = reader.readlstr()
+        self.want_reply = reader.readboolean()
+        requests: dict[str, type[RequestBody]] = {
+            "shell": ShellRequest,
+            "exec": ExecRequest,
+            "signal": SignalRequest,
+            "exit-status": ExitStatusRequest,
+            "exit-signal": ExitSignalRequest,
+        }
+        self.request = requests[name]() if name in requests else OpaqueRequest(name)
+        self.request.decode(reader)
+
+
+class Msg99_ChannelSuccess(RecipientMessage):
+    msgtype: ClassVar[int] = 99
+
+
+class Msg100_ChannelFailure(RecipientMessage):
+    msgtype: ClassVar[int] = 100
+
+
+MESSAGE_CLASSES: tuple[type[SshPacket], ...] = (
+    Msg1_Disconnect,
+    Msg2_Ignore,
+    Msg3_Unimplemented,
+    Msg4_Debug,
+    Msg5_ServiceRequest,
+    Msg6_ServiceAccept,
+    Msg20_KexInit,
+    Msg21_NewKeys,
+    Msg30_ECDHInit,
+    Msg31_ECDHReply,
+    Msg50_UserAuthRequest,
+    Msg51_UserAuthFailure,
+    Msg52_UserAuthSuccess,
+    Msg53_UserAuthBanner,
+    Msg60_UserAuthPKOK,
+    Msg80_GlobalRequest,
+    Msg81_RequestSuccess,
+    Msg82_RequestFailure,
+    Msg90_ChannelOpen,
+    Msg91_ChannelOpenConfirmation,
+    Msg92_ChannelOpenFailure,
+    Msg93_ChannelWindowAdjust,
+    Msg94_ChannelData,
+    Msg95_ChannelExtendedData,
+    Msg96_ChannelEOF,
+    Msg97_ChannelClose,
+    Msg98_ChannelRequest,
+    Msg99_ChannelSuccess,
+    Msg100_ChannelFailure,
+)
+MESSAGE_TYPES: dict[int, type[SshPacket]] = {cls().msgtype: cls for cls in MESSAGE_CLASSES}
+
+
+def encode_message(packet: SshPacket) -> bytes:
+    writer = SSHWriter()
+    writer.writebyte(packet.msgtype)
+    packet.encode(writer)
+    return writer.getvalue()
+
+
+def decode_message(reader: SSHReader) -> SshPacket:
+    msgtype = reader.readbyte()
+    packet = MESSAGE_TYPES[msgtype]() if msgtype in MESSAGE_TYPES else RawPacket(msgtype)
+    packet.decode(reader)
+    reader.finish()
+    return packet
+
+
+@dataclass
+class SSH2Frame(WireObject):
+    """Transport header, message-type byte/body, and padding in wire order."""
+
+    packet: SshPacket = field(default_factory=Msg21_NewKeys)
+    padding: bytes = b""
+    header_size: int = 5
+
+    @property
+    def packet_length(self) -> int:
+        return 1 + len(encode_message(self.packet)) + len(self.padding)
+
+    def encode(self, writer: SSHWriter) -> None:
+        payload = encode_message(self.packet)
+        if not self.padding:
+            self.padding = os.urandom(padding_size(len(payload), header_size=self.header_size))
+        writer.write32be(1 + len(payload) + len(self.padding))
+        writer.writebyte(len(self.padding))
+        writer.write(payload)
+        writer.write(self.padding)
+
+    def decode(self, reader: SSHReader) -> None:
+        length = reader.read32be()
+        padding_length = reader.readbyte()
+        if length > MAX_PACKET or length < (12 if self.header_size == 5 else 8) or length - 1 > reader.remaining():
+            raise ProtocolError("invalid or truncated SSH frame length")
+        if (length + self.header_size - 1) % 8:
+            raise ProtocolError("unaligned SSH frame")
+        if padding_length < 4 or padding_length + 2 > length:
+            raise ProtocolError("invalid SSH padding length")
+        payload = reader.read(length - padding_length - 1)
+        self.packet = decode_message(SSHReader(payload))
+        self.padding = reader.read(padding_length)
+
+
+@dataclass
+class EncryptedData(WireObject):
+    """Opaque ciphertext; encrypted message boundaries are unknown."""
+
+    data: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write(self.data)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.data = reader.read(reader.remaining())
+
+
+@dataclass
+class Banner(WireObject):
+    """Preserved server pre-identification line; not part of the KEX hash."""
+
+    data: bytes = b""
+
+    def encode(self, writer: SSHWriter) -> None:
+        writer.write(self.data)
+
+    def decode(self, reader: SSHReader) -> None:
+        self.data = reader.readuntil(b"\n")
 
 
 @dataclass(frozen=True)
@@ -443,9 +1073,7 @@ class Algorithms:
         raise ProtocolError("no mutually supported algorithm")
 
     @classmethod
-    def negotiate(
-        cls, client: Msg20_KexInit, server: Msg20_KexInit
-    ) -> Algorithms:
+    def negotiate(cls, client: Msg20_KexInit, server: Msg20_KexInit) -> Algorithms:
         choose = cls.choose
         c2s = choose(client.c2s_encryption, server.c2s_encryption)
         s2c = choose(client.s2c_encryption, server.s2c_encryption)
@@ -454,17 +1082,11 @@ class Algorithms:
             choose(client.hostkey_algorithms, server.hostkey_algorithms),
             c2s,
             s2c,
-            "implicit"
-            if c2s == CIPHER
-            else choose(client.c2s_mac, server.c2s_mac),
-            "implicit"
-            if s2c == CIPHER
-            else choose(client.s2c_mac, server.s2c_mac),
+            "implicit" if c2s == CIPHER else choose(client.c2s_mac, server.c2s_mac),
+            "implicit" if s2c == CIPHER else choose(client.s2c_mac, server.s2c_mac),
             choose(client.c2s_comp, server.c2s_comp),
             choose(client.s2c_comp, server.s2c_comp),
-            "kex-strict-c-v00@openssh.com" in client.kex_algorithms.split(",")
-            and "kex-strict-s-v00@openssh.com"
-            in server.kex_algorithms.split(","),
+            "kex-strict-c-v00@openssh.com" in client.kex_algorithms.split(",") and "kex-strict-s-v00@openssh.com" in server.kex_algorithms.split(","),
         )
 
     def require_supported(self) -> None:
@@ -477,58 +1099,6 @@ class Algorithms:
             or self.s2c_comp != "none"
         ):
             raise ProtocolError(f"unsupported negotiated suite: {self}")
-
-
-@dataclass
-class SSH2Frame:
-    packet: SshPacket
-    padding: bytes = b""
-
-    @property
-    def packet_length(self) -> int:
-        return 1 + len(self.packet.to_payload()) + len(self.padding)
-
-    def to_bytes(self) -> bytes:
-        payload = self.packet.to_payload()
-        pad = self.padding or os.urandom(padding_size(len(payload)))
-        length = 1 + len(payload) + len(pad)
-        return struct.pack(">IB", length, len(pad)) + payload + pad
-
-    def encode(self, writer: BaseWriter) -> None:
-        writer.write(self.to_bytes())
-
-    @classmethod
-    def from_bytes(cls, data: bytes, header_size: int = 5) -> SSH2Frame:
-        if len(data) < 6:
-            raise ProtocolError("truncated SSH frame")
-        length, pad = struct.unpack(">IB", data[:5])
-        if length > MAX_PACKET or length + 4 != len(data):
-            raise ProtocolError("invalid SSH packet length")
-        if (length + header_size - 1) % 8:
-            raise ProtocolError("unaligned SSH frame")
-        if pad < 4 or pad + 2 > length:
-            raise ProtocolError("invalid SSH padding length")
-        return cls(SshPacket.from_payload(data[5:-pad]), data[-pad:])
-
-
-@dataclass(frozen=True)
-class EncryptedData:
-    """Opaque ciphertext; encrypted message boundaries are unknown."""
-
-    data: bytes
-
-    def to_bytes(self) -> bytes:
-        return self.data
-
-
-@dataclass(frozen=True)
-class Banner:
-    """Preserved server pre-identification line; not part of the KEX hash."""
-
-    data: bytes
-
-    def to_bytes(self) -> bytes:
-        return self.data
 
 
 @dataclass(frozen=True)
@@ -578,15 +1148,15 @@ class TranscriptStream:
             if not line.startswith(b"SSH-"):
                 return Banner(line)
             self.identified = True
-            return Hello.from_bytes(line)
+            return decode_object(Hello(), line)
         if len(self.buffer) < 4:
             return None
-        length = struct.unpack(">I", self.buffer[:4])[0]
+        length = SSHReader(bytes(self.buffer[:4])).read32be()
         if length < 12 or length > MAX_PACKET:
             raise ProtocolError("invalid plaintext frame length")
         if len(self.buffer) < length + 4:
             return None
-        frame = SSH2Frame.from_bytes(self._take(length + 4))
+        frame = decode_object(SSH2Frame(), self._take(length + 4))
         self.encrypted = frame.packet.msgtype == 21
         return frame
 
@@ -623,7 +1193,10 @@ class ChaChaPoly:
 
     @staticmethod
     def _crypt(key: bytes, sequence: int, counter: int, data: bytes) -> bytes:
-        nonce = struct.pack("<Q", counter) + struct.pack(">Q", sequence)
+        writer = SSHWriter()
+        writer.write64le(counter)
+        writer.write64be(sequence)
+        nonce = writer.getvalue()
         cipher = Cipher(algorithms.ChaCha20(key, nonce), mode=None)
         return cipher.encryptor().update(data)
 
@@ -632,30 +1205,32 @@ class ChaChaPoly:
 
     def length(self, sequence: int, encrypted_header: bytes) -> int:
         header = self._crypt(self.header_key, sequence, 0, encrypted_header)
-        return struct.unpack(">I", header)[0]
+        return SSHReader(header).read32be()
 
     def seal(self, sequence: int, payload: bytes) -> bytes:
         count = padding_size(len(payload), header_size=1)
-        body = bytes([count]) + payload + os.urandom(count)
-        header = struct.pack(">I", len(body))
+        body_writer = SSHWriter()
+        body_writer.writebyte(count)
+        body_writer.write(payload)
+        body_writer.write(os.urandom(count))
+        body = body_writer.getvalue()
+        header_writer = SSHWriter()
+        header_writer.write32be(len(body))
+        header = header_writer.getvalue()
         encrypted = self._crypt(self.header_key, sequence, 0, header)
         encrypted += self._crypt(self.body_key, sequence, 1, body)
-        return encrypted + Poly1305.generate_tag(
-            self._poly_key(sequence), encrypted
-        )
+        return encrypted + Poly1305.generate_tag(self._poly_key(sequence), encrypted)
 
     def open(self, sequence: int, data: bytes) -> SSH2Frame:
         if len(data) < 4 + 8 + 16:
             raise ProtocolError("truncated authenticated packet")
         try:
-            Poly1305.verify_tag(
-                self._poly_key(sequence), data[:-16], data[-16:]
-            )
+            Poly1305.verify_tag(self._poly_key(sequence), data[:-16], data[-16:])
         except InvalidSignature as exc:
             raise ProtocolError("SSH packet authentication failed") from exc
         header = self._crypt(self.header_key, sequence, 0, data[:4])
         body = self._crypt(self.body_key, sequence, 1, data[4:-16])
-        return SSH2Frame.from_bytes(header + body, header_size=1)
+        return decode_object(SSH2Frame(header_size=1), header + body)
 
 
 class Transport:
@@ -676,12 +1251,7 @@ class Transport:
         result = bytearray()
         while len(result) < count:
             if self.outgoing:
-                ready, writable, _ = select.select(
-                    [self.sock],
-                    [self.sock],
-                    [],
-                    self.sock.gettimeout(),
-                )
+                ready, writable, _ = select.select([self.sock], [self.sock], [], self.sock.gettimeout())
                 if not ready and not writable:
                     raise TimeoutError("SSH read/write timed out")
                 if writable:
@@ -696,35 +1266,29 @@ class Transport:
 
     def exchange_hello(self, server: bool) -> tuple[Hello, Hello]:
         local = Hello()
-        self.sock.sendall(local.to_bytes())
+        self.sock.sendall(encode_object(local))
         for _ in range(50):
             line = bytearray()
             while not line.endswith(b"\n"):
                 line.extend(self.read_exact(1))
                 if len(line) > 255:
-                    raise ProtocolError(
-                        "identification/pre-banner line too long"
-                    )
+                    raise ProtocolError("identification/pre-banner line too long")
             if line.startswith(b"SSH-"):
-                return local, Hello.from_bytes(bytes(line))
+                return local, decode_object(Hello(), bytes(line))
             if server:
-                raise ProtocolError(
-                    "client pre-identification text is forbidden"
-                )
+                raise ProtocolError("client pre-identification text is forbidden")
             # Server pre-banner lines are intentionally excluded from KEX.
         raise ProtocolError("too many server pre-identification lines")
 
     def send(self, packet: SshPacket) -> None:
         with self.send_lock:
             if self.send_sequence >= 2**32:
-                raise ProtocolError(
-                    "packet sequence exhausted; rekey required"
-                )
-            payload = packet.to_payload()
+                raise ProtocolError("packet sequence exhausted; rekey required")
+            payload = encode_message(packet)
             if len(payload) > MAX_PACKET - 256:
                 raise ProtocolError("outgoing packet too large")
             if self.send_cipher is None:
-                data = SSH2Frame(packet).to_bytes()
+                data = encode_object(SSH2Frame(packet))
             else:
                 data = self.send_cipher.seal(self.send_sequence, payload)
             self.outgoing.extend(data)
@@ -751,19 +1315,11 @@ class Transport:
             raise ProtocolError("packet sequence exhausted; rekey required")
         header = self.read_exact(4)
         cipher = self.recv_cipher
-        length = (
-            struct.unpack(">I", header)[0]
-            if cipher is None
-            else cipher.length(self.recv_sequence, header)
-        )
+        length = SSHReader(header).read32be() if cipher is None else cipher.length(self.recv_sequence, header)
         if length < 8 or length > MAX_PACKET:
             raise ProtocolError(f"invalid packet length: {length}")
         tail = self.read_exact(length + (16 if cipher else 0))
-        frame = (
-            SSH2Frame.from_bytes(header + tail)
-            if cipher is None
-            else cipher.open(self.recv_sequence, header + tail)
-        )
+        frame = decode_object(SSH2Frame(), header + tail) if cipher is None else cipher.open(self.recv_sequence, header + tail)
         self.recv_sequence += 1
         self.received_bytes += 4 + len(tail)
         return frame.packet
@@ -776,24 +1332,15 @@ class ExchangeInputs:
     client_init: bytes
     server_init: bytes
 
-    def digest(
-        self,
-        hostkey: HostKey,
-        client_key: bytes,
-        server_key: bytes,
-        encoded_secret: bytes,
-    ) -> bytes:
-        writer = DataWriter()
-        for value in (
-            self.client_version.encode("ascii"),
-            self.server_version.encode("ascii"),
-            self.client_init,
-            self.server_init,
-            hostkey.to_bytes(),
-            client_key,
-            server_key,
-        ):
-            writeldata(writer, value)
+    def digest(self, hostkey: HostKey, client_key: bytes, server_key: bytes, encoded_secret: bytes) -> bytes:
+        writer = SSHWriter()
+        writer.writelstr(self.client_version, "ascii")
+        writer.writelstr(self.server_version, "ascii")
+        writer.writeldata(self.client_init)
+        writer.writeldata(self.server_init)
+        writer.writeldata(encode_object(hostkey))
+        writer.writeldata(client_key)
+        writer.writeldata(server_key)
         writer.write(encoded_secret)
         return hashlib.sha256(writer.getvalue()).digest()
 
@@ -804,23 +1351,15 @@ def encoded_curve_secret(secret: bytes) -> bytes:
     value = secret.lstrip(b"\x00")
     if value and value[0] & 0x80:
         value = b"\x00" + value
-    return Message(0).string(value).build().body
+    writer = SSHWriter()
+    writer.writeldata(value)
+    return writer.getvalue()
 
 
-def derive_key(
-    encoded_secret: bytes,
-    exchange_hash: bytes,
-    letter: bytes,
-    session_id: bytes,
-    size: int = 64,
-) -> bytes:
-    material = hashlib.sha256(
-        encoded_secret + exchange_hash + letter + session_id,
-    ).digest()
+def derive_key(encoded_secret: bytes, exchange_hash: bytes, letter: bytes, session_id: bytes, size: int = 64) -> bytes:
+    material = hashlib.sha256(encoded_secret + exchange_hash + letter + session_id).digest()
     while len(material) < size:
-        material += hashlib.sha256(
-            encoded_secret + exchange_hash + material
-        ).digest()
+        material += hashlib.sha256(encoded_secret + exchange_hash + material).digest()
     return material[:size]
 
 
@@ -834,44 +1373,40 @@ class KeyExchange:
         public = self.curve.public_key().public_bytes_raw()
         if self.algorithm == KEX_HYBRID:
             self.kem = mlkem.MLKEM768PrivateKey.generate()
-            return self.kem.public_key().public_bytes_raw() + public
+            return encode_object(HybridInit(self.kem.public_key().public_bytes_raw(), public))
         return public
 
     def server_reply(self, client_key: bytes) -> tuple[bytes, bytes]:
         public = self.curve.public_key().public_bytes_raw()
         if self.algorithm == KEX_HYBRID:
-            parts = HybridInit.decode(client_key)
+            parts = decode_object(HybridInit(), client_key)
             peer = mlkem.MLKEM768PublicKey.from_public_bytes(parts.kem_public)
             kem_secret, ciphertext = peer.encapsulate()
-            classical = self.curve.exchange(
-                x25519.X25519PublicKey.from_public_bytes(parts.x25519_public),
-            )
+            classical = self.curve.exchange(x25519.X25519PublicKey.from_public_bytes(parts.x25519_public))
             shared = hashlib.sha256(kem_secret + classical).digest()
-            return ciphertext + public, Message(0).string(shared).build().body
+            writer = SSHWriter()
+            writer.writeldata(shared)
+            return encode_object(HybridReply(ciphertext, public)), writer.getvalue()
         if len(client_key) != 32:
             raise ProtocolError("Curve25519 public key must have 32 bytes")
-        secret = self.curve.exchange(
-            x25519.X25519PublicKey.from_public_bytes(client_key)
-        )
+        secret = self.curve.exchange(x25519.X25519PublicKey.from_public_bytes(client_key))
         return public, encoded_curve_secret(secret)
 
     def client_finish(self, server_key: bytes) -> bytes:
         if self.algorithm == KEX_HYBRID:
             if self.kem is None:
                 raise ProtocolError("missing ML-KEM client private key")
-            parts = HybridReply.decode(server_key)
+            parts = decode_object(HybridReply(), server_key)
             kem_secret = self.kem.decapsulate(parts.kem_ciphertext)
-            classical = self.curve.exchange(
-                x25519.X25519PublicKey.from_public_bytes(parts.x25519_public),
-            )
+            classical = self.curve.exchange(x25519.X25519PublicKey.from_public_bytes(parts.x25519_public))
             shared = hashlib.sha256(kem_secret + classical).digest()
             self.kem = None
-            return Message(0).string(shared).build().body
+            writer = SSHWriter()
+            writer.writeldata(shared)
+            return writer.getvalue()
         if len(server_key) != 32:
             raise ProtocolError("Curve25519 public key must have 32 bytes")
-        secret = self.curve.exchange(
-            x25519.X25519PublicKey.from_public_bytes(server_key)
-        )
+        secret = self.curve.exchange(x25519.X25519PublicKey.from_public_bytes(server_key))
         return encoded_curve_secret(secret)
 
 
@@ -890,10 +1425,9 @@ class Connection:
         self.server = server
         self.host_key = host_key
         self.pinned_key = pinned_key
+        self.unverified_key_warned = False
         self.curve_only = curve_only
-        self.local_version, self.remote_version = (
-            self.transport.exchange_hello(server)
-        )
+        self.local_version, self.remote_version = self.transport.exchange_hello(server)
         self.session_id = b""
         self.auth_service_started = False
         self.pending_packets: deque[SshPacket] = deque()
@@ -910,23 +1444,15 @@ class Connection:
                 # Explicitly ignore IGNORE/DEBUG during non-strict KEX.
                 continue
             self._check_disconnect(packet)
-            raise ProtocolError(
-                f"expected KEX message {msgtype}, got {packet.msgtype}"
-            )
+            raise ProtocolError(f"expected KEX message {msgtype}, got {packet.msgtype}")
         raise ProtocolError("too many transport messages during KEX")
 
     @staticmethod
     def _check_disconnect(packet: SshPacket) -> None:
-        if packet.msgtype == 1:
-            reader = MessageReader(packet)
-            code, text = reader.u32(), reader.text()
-            reader.text()
-            reader.end()
-            raise ProtocolError(f"peer disconnected ({code}): {text}")
+        if isinstance(packet, Msg1_Disconnect):
+            raise ProtocolError(f"peer disconnected ({packet.reason}): {packet.description}")
 
-    def _proposals(
-        self, peer: SshPacket | None
-    ) -> tuple[Msg20_KexInit, Msg20_KexInit]:
+    def _proposals(self, peer: SshPacket | None) -> tuple[Msg20_KexInit, Msg20_KexInit]:
         local = Msg20_KexInit.proposal(self.server, self.curve_only)
         self.transport.send(local)
         previous_strict = bool(self.suite and self.suite.strict)
@@ -942,16 +1468,11 @@ class Connection:
         self.suite.require_supported()
         if not self.session_id and self.suite.strict:
             if self.transport.recv_sequence != 1:
-                raise ProtocolError(
-                    "strict KEX requires KEXINIT as first packet"
-                )
+                raise ProtocolError("strict KEX requires KEXINIT as first packet")
         if peer.kexfollows:
             guessed_kex = peer.kex_algorithms.split(",")[0]
             guessed_host = peer.hostkey_algorithms.split(",")[0]
-            if (
-                guessed_kex != self.suite.kex
-                or guessed_host != self.suite.hostkey
-            ):
+            if guessed_kex != self.suite.kex or guessed_host != self.suite.hostkey:
                 # RFC 4253: discard one wrong guessed packet.
                 self.transport.receive()
         return client, server
@@ -968,24 +1489,15 @@ class Connection:
             # be delivered later, in their original order.
             if packet.msgtype not in (2, 4):
                 self.pending_packets.append(packet)
-        raise ProtocolError(
-            "too many in-flight messages before rekey proposal"
-        )
+        raise ProtocolError("too many in-flight messages before rekey proposal")
 
     def key_exchange(self, peer: SshPacket | None = None) -> None:
         client, server = self._proposals(peer)
         assert self.suite is not None
         client_version, server_version = (
-            (self.remote_version.version, self.local_version.version)
-            if self.server
-            else (self.local_version.version, self.remote_version.version)
+            (self.remote_version.version, self.local_version.version) if self.server else (self.local_version.version, self.remote_version.version)
         )
-        inputs = ExchangeInputs(
-            client_version,
-            server_version,
-            client.to_payload(),
-            server.to_payload(),
-        )
+        inputs = ExchangeInputs(client_version, server_version, encode_message(client), encode_message(server))
         exchange = KeyExchange(self.suite.kex)
         if self.server:
             encoded_secret, digest = self._server_exchange(exchange, inputs)
@@ -995,52 +1507,37 @@ class Connection:
             self.session_id = digest
         self._newkeys(encoded_secret, digest)
 
-    def _server_exchange(
-        self, exchange: KeyExchange, inputs: ExchangeInputs
-    ) -> tuple[bytes, bytes]:
+    def _server_exchange(self, exchange: KeyExchange, inputs: ExchangeInputs) -> tuple[bytes, bytes]:
         assert self.suite is not None
         packet = self._expect_kex(30, self.suite.strict)
         assert isinstance(packet, Msg30_ECDHInit)
         server_key, encoded_secret = exchange.server_reply(packet.pubkey)
         if self.host_key is None:
             raise HostKeyError("server needs an Ed25519 private host key")
-        host = HostKey(
-            "ssh-ed25519", self.host_key.public_key().public_bytes_raw()
-        )
+        host = HostKey("ssh-ed25519", self.host_key.public_key().public_bytes_raw())
         digest = inputs.digest(host, packet.pubkey, server_key, encoded_secret)
         signature = Signature("ssh-ed25519", self.host_key.sign(digest))
         self.transport.send(Msg31_ECDHReply(host, server_key, signature))
         return encoded_secret, digest
 
-    def _client_exchange(
-        self, exchange: KeyExchange, inputs: ExchangeInputs
-    ) -> tuple[bytes, bytes]:
+    def _client_exchange(self, exchange: KeyExchange, inputs: ExchangeInputs) -> tuple[bytes, bytes]:
         assert self.suite is not None
         client_key = exchange.client_init()
         self.transport.send(Msg30_ECDHInit(client_key))
         packet = self._expect_kex(31, self.suite.strict)
         assert isinstance(packet, Msg31_ECDHReply)
-        if self.pinned_key is None or not hmac.compare_digest(
-            packet.hostkey.to_bytes(), self.pinned_key.to_bytes()
-        ):
-            raise HostKeyError(
-                f"untrusted server host key: {packet.hostkey.fingerprint()}"
-            )
+        if self.pinned_key is not None:
+            if not hmac.compare_digest(encode_object(packet.hostkey), encode_object(self.pinned_key)):
+                raise HostKeyError(f"server host key does not match the pin: {packet.hostkey.fingerprint()}")
+        elif not self.unverified_key_warned:
+            warnings.warn(f"host key is not verified: {packet.hostkey.fingerprint()}", RuntimeWarning, stacklevel=2)
+            self.unverified_key_warned = True
         encoded_secret = exchange.client_finish(packet.pubkey)
-        digest = inputs.digest(
-            packet.hostkey, client_key, packet.pubkey, encoded_secret
-        )
+        digest = inputs.digest(packet.hostkey, client_key, packet.pubkey, encoded_secret)
         try:
-            ed25519.Ed25519PublicKey.from_public_bytes(
-                packet.hostkey.key
-            ).verify(
-                packet.signature.data,
-                digest,
-            )
+            ed25519.Ed25519PublicKey.from_public_bytes(packet.hostkey.key).verify(packet.signature.data, digest)
         except InvalidSignature as exc:
-            raise HostKeyError(
-                "invalid server key-exchange signature"
-            ) from exc
+            raise HostKeyError("invalid server key-exchange signature") from exc
         return encoded_secret, digest
 
     def _newkeys(self, encoded_secret: bytes, digest: bytes) -> None:
@@ -1059,21 +1556,13 @@ class Connection:
         self.rekey_deadline = time.monotonic() + 3600
 
     def send(self, packet: SshPacket) -> None:
-        if (
-            self.transport.sent_bytes > 512 * 1024 * 1024
-            or self.transport.received_bytes > 512 * 1024 * 1024
-            or time.monotonic() >= self.rekey_deadline
-        ):
+        if self.transport.sent_bytes > 512 * 1024 * 1024 or self.transport.received_bytes > 512 * 1024 * 1024 or time.monotonic() >= self.rekey_deadline:
             self.key_exchange()
         self.transport.send(packet)
 
     def receive(self) -> SshPacket:
         for _ in range(100):
-            packet = (
-                self.pending_packets.popleft()
-                if self.pending_packets
-                else self.transport.receive()
-            )
+            packet = self.pending_packets.popleft() if self.pending_packets else self.transport.receive()
             self._check_disconnect(packet)
             if packet.msgtype == 20:
                 self.key_exchange(packet)
@@ -1088,9 +1577,7 @@ class Connection:
     def expect(self, msgtype: int) -> SshPacket:
         packet = self.receive()
         if packet.msgtype != msgtype:
-            raise ProtocolError(
-                f"expected message {msgtype}, got {packet.msgtype}"
-            )
+            raise ProtocolError(f"expected message {msgtype}, got {packet.msgtype}")
         return packet
 
     def close(self) -> None:
@@ -1112,222 +1599,124 @@ class Credentials:
         return ",".join(names)
 
     def matches(self, username: str, password: bytes) -> bool:
-        user_ok = hmac.compare_digest(
-            self.username.encode("utf-8"), username.encode("utf-8")
-        )
-        password_ok = hmac.compare_digest(
-            (self.password or "").encode("utf-8"), password
-        )
+        user_ok = hmac.compare_digest(self.username.encode("utf-8"), username.encode("utf-8"))
+        password_ok = hmac.compare_digest((self.password or "").encode("utf-8"), password)
         return user_ok & password_ok & (self.password is not None)
 
 
-def verify_user_key(
-    connection: Connection, credentials: Credentials, reader: MessageReader
-) -> bool | None:
-    signed, algorithm, blob = reader.boolean(), reader.text(), reader.string()
-    # The signed request includes everything through the key blob, but not
-    # the trailing signature string.
-    prefix = bytes([50]) + reader.data[: reader.tell()]
-    trusted = algorithm == "ssh-ed25519" and any(
-        hmac.compare_digest(blob, key.to_bytes())
-        for key in credentials.authorized_keys
-    )
-    if not signed:
-        reader.end()
+def verify_user_key(connection: Connection, credentials: Credentials, packet: Msg50_UserAuthRequest) -> bool | None:
+    method = packet.method
+    assert isinstance(method, PublicKeyAuth)
+    trusted = method.algorithm == "ssh-ed25519" and any(hmac.compare_digest(method.public_key, encode_object(key)) for key in credentials.authorized_keys)
+    if not method.signed:
         if trusted:
-            connection.send(Message(60).string(algorithm).string(blob).build())
+            connection.send(Msg60_UserAuthPKOK(method.algorithm, method.public_key))
             return None
         return False
-    signature_blob = reader.string()
-    reader.end()
-    if not trusted:
+    if not trusted or method.signature is None:
         return False
-    key, signature = (
-        HostKey.from_bytes(blob),
-        Signature.from_bytes(signature_blob),
-    )
-    payload = Message(0).string(connection.session_id).raw(prefix).build().body
+    key = decode_object(HostKey(), method.public_key)
+    method.signature.require_ed25519()
+    signed_data = packet.signature_input(connection.session_id)
     try:
-        ed25519.Ed25519PublicKey.from_public_bytes(key.key).verify(
-            signature.data, payload
-        )
+        ed25519.Ed25519PublicKey.from_public_bytes(key.key).verify(method.signature.data, signed_data)
     except InvalidSignature:
         return False
     return True
 
 
-def client_publickey_authenticate(
-    connection: Connection,
-    username: str,
-    private_key: ed25519.Ed25519PrivateKey,
-) -> None:
+def client_publickey_authenticate(connection: Connection, username: str, private_key: ed25519.Ed25519PrivateKey) -> None:
     begin_client_auth(connection)
     host = HostKey("ssh-ed25519", private_key.public_key().public_bytes_raw())
-    request = (
-        Message(50)
-        .string(username)
-        .string("ssh-connection")
-        .string("publickey")
-        .boolean(True)
-        .string("ssh-ed25519")
-        .string(host.to_bytes())
-    )
-    signed = (
-        Message(0)
-        .string(connection.session_id)
-        .raw(request.build().to_payload())
-        .build()
-        .body
-    )
-    signature = Signature("ssh-ed25519", private_key.sign(signed))
-    connection.send(request.string(signature.to_bytes()).build())
+    method = PublicKeyAuth(signed=True, public_key=encode_object(host))
+    request = Msg50_UserAuthRequest(username=username, method=method)
+    signed_data = request.signature_input(connection.session_id)
+    method.signature = Signature("ssh-ed25519", private_key.sign(signed_data))
+    connection.send(request)
     finish_client_auth(connection)
 
 
-def server_authenticate(
-    connection: Connection, credentials: Credentials
-) -> None:
-    request = MessageReader(connection.expect(5))
-    if request.text() != "ssh-userauth":
+def server_authenticate(connection: Connection, credentials: Credentials) -> None:
+    request = connection.expect(5)
+    assert isinstance(request, Msg5_ServiceRequest)
+    if request.service != "ssh-userauth":
         raise ProtocolError("only ssh-userauth service supported")
-    request.end()
-    connection.send(Message(6).string("ssh-userauth").build())
+    connection.send(Msg6_ServiceAccept("ssh-userauth"))
     for _ in range(12):
-        reader = MessageReader(connection.expect(50))
-        username, service, method = reader.text(), reader.text(), reader.text()
+        packet = connection.expect(50)
+        assert isinstance(packet, Msg50_UserAuthRequest)
+        account_matches = packet.service == "ssh-connection" and packet.username == credentials.username
         accepted = False
-        if method == "password":
-            change, password = reader.boolean(), reader.string()
-            if change:
-                # New password explicitly consumed; changes rejected.
-                reader.string()
-            reader.end()
-            accepted = (
-                not change
-                and service == "ssh-connection"
-                and credentials.matches(username, password)
-            )
-        elif method == "publickey":
-            if (
-                service == "ssh-connection"
-                and username == credentials.username
-            ):
-                outcome = verify_user_key(connection, credentials, reader)
-                if outcome is None:
-                    continue  # Valid unsigned probe was answered with PK_OK.
-                accepted = outcome
-            else:
-                reader.read(
-                    reader.remaining()
-                )  # Wrong account/service: reject opaque body.
-        elif method == "none":
-            reader.end()
-        else:
-            # Unsupported authentication-method fields are opaque and rejected.
-            reader.read(reader.remaining())
+        if isinstance(packet.method, PasswordAuth):
+            accepted = account_matches and not packet.method.change and credentials.matches(packet.username, packet.method.password)
+        elif isinstance(packet.method, PublicKeyAuth) and account_matches:
+            outcome = verify_user_key(connection, credentials, packet)
+            if outcome is None:
+                continue  # Valid unsigned probe was answered with PK_OK.
+            accepted = outcome
+        # NoneAuth and UnknownAuth are explicitly rejected. UnknownAuth retains
+        # the complete unsupported method-specific payload for inspection.
         if accepted:
-            connection.send(RawPacket(52))
+            connection.send(Msg52_UserAuthSuccess())
             return
-        connection.send(
-            Message(51).string(credentials.methods()).boolean(False).build()
-        )
+        connection.send(Msg51_UserAuthFailure(credentials.methods(), False))
     raise AuthenticationError("too many authentication attempts")
 
 
 def begin_client_auth(connection: Connection) -> None:
     if connection.auth_service_started:
         return
-    connection.send(Message(5).string("ssh-userauth").build())
-    reader = MessageReader(connection.expect(6))
-    if reader.text() != "ssh-userauth":
+    connection.send(Msg5_ServiceRequest("ssh-userauth"))
+    reply = connection.expect(6)
+    assert isinstance(reply, Msg6_ServiceAccept)
+    if reply.service != "ssh-userauth":
         raise ProtocolError("wrong accepted service")
-    reader.end()
     connection.auth_service_started = True
 
 
-def client_authenticate(
-    connection: Connection, credentials: Credentials
-) -> None:
+def client_authenticate(connection: Connection, credentials: Credentials) -> None:
     begin_client_auth(connection)
     if credentials.password is None:
         raise AuthenticationError("password not supplied")
-    connection.send(
-        Message(50)
-        .string(credentials.username)
-        .string("ssh-connection")
-        .string("password")
-        .boolean(False)
-        .string(credentials.password)
-        .build()
-    )
+    method = PasswordAuth(password=credentials.password.encode("utf-8"))
+    connection.send(Msg50_UserAuthRequest(username=credentials.username, method=method))
     finish_client_auth(connection)
 
 
 def finish_client_auth(connection: Connection) -> None:
     for _ in range(20):
         packet = connection.receive()
-        reader = MessageReader(packet)
-        if packet.msgtype == 52:
-            reader.end()
+        if isinstance(packet, Msg52_UserAuthSuccess):
             return
-        if packet.msgtype == 53:
-            reader.text()  # Banner intentionally not printed by this API.
-            reader.text()  # Language tag.
-            reader.end()
-            continue
-        if packet.msgtype == 51:
-            methods, partial = reader.text(), reader.boolean()
-            reader.end()
-            raise AuthenticationError(
-                f"authentication rejected; methods={methods}, "
-                f"partial={partial}"
-            )
-        raise ProtocolError(
-            f"unexpected authentication message {packet.msgtype}"
-        )
+        if isinstance(packet, Msg53_UserAuthBanner):
+            continue  # Decoded server banner intentionally not printed by this API.
+        if isinstance(packet, Msg51_UserAuthFailure):
+            raise AuthenticationError(f"authentication rejected; methods={packet.methods}, partial={packet.partial}")
+        raise ProtocolError(f"unexpected authentication message {packet.msgtype}")
     raise ProtocolError("too many authentication banners")
 
 
 def handle_global(connection: Connection, packet: SshPacket) -> bool:
-    if packet.msgtype != 80:
+    if not isinstance(packet, Msg80_GlobalRequest):
         return False
-    reader = MessageReader(packet)
-    reader.text()  # Global request name; all are rejected.
-    want_reply = reader.boolean()
-    reader.read(
-        reader.remaining()
-    )  # Unsupported request-specific data is opaque.
-    if want_reply:
-        connection.send(RawPacket(82))
+    # The unsupported request-specific fields remain in packet.data.
+    if packet.want_reply:
+        connection.send(Msg82_RequestFailure())
     return True
 
 
 @dataclass(frozen=True)
 class ChannelData:
+    """Application data delivered by a channel, not a wire message."""
+
     stream: int
     data: bytes
-
-
-@dataclass(frozen=True)
-class ChannelRequest:
-    name: str
-    want_reply: bool
-    data: bytes
-
-    def reader(self) -> DataReader:
-        return DataReader(self.data)
 
 
 class Channel:
     """One SSH session channel, including bounded receive/send windows."""
 
-    def __init__(
-        self,
-        connection: Connection,
-        remote: int,
-        send_window: int,
-        max_packet: int,
-    ):
+    def __init__(self, connection: Connection, remote: int, send_window: int, max_packet: int):
         if max_packet < 1:
             raise ProtocolError("zero maximum channel packet size")
         self.connection = connection
@@ -1344,26 +1733,16 @@ class Channel:
 
     @classmethod
     def open_client(cls, connection: Connection) -> Channel:
-        connection.send(
-            Message(90)
-            .string("session")
-            .u32(0)
-            .u32(CHANNEL_WINDOW)
-            .u32(CHANNEL_PACKET)
-            .build()
-        )
+        connection.send(Msg90_ChannelOpen())
         while True:
             packet = connection.receive()
             if handle_global(connection, packet):
                 continue
-            reader = MessageReader(packet)
-            if packet.msgtype == 92:
-                raise ProtocolError("server rejected session channel")
-            if packet.msgtype != 91 or reader.u32() != 0:
+            if isinstance(packet, Msg92_ChannelOpenFailure):
+                raise ProtocolError(f"server rejected session channel: {packet.description}")
+            if not isinstance(packet, Msg91_ChannelOpenConfirmation) or packet.recipient != 0 or packet.extra:
                 raise ProtocolError("expected session open confirmation")
-            result = cls(connection, reader.u32(), reader.u32(), reader.u32())
-            reader.end()
-            return result
+            return cls(connection, packet.sender, packet.window, packet.max_packet)
 
     @classmethod
     def open_server(cls, connection: Connection) -> Channel:
@@ -1371,60 +1750,33 @@ class Channel:
             packet = connection.receive()
             if handle_global(connection, packet):
                 continue
-            if packet.msgtype != 90:
+            if not isinstance(packet, Msg90_ChannelOpen):
                 raise ProtocolError("expected channel open")
-            reader = MessageReader(packet)
-            name, remote = reader.text(), reader.u32()
-            window, max_packet = reader.u32(), reader.u32()
-            if name != "session":
-                connection.send(
-                    Message(92)
-                    .u32(remote)
-                    .u32(1)
-                    .string("only session channels supported")
-                    .string("")
-                    .build()
-                )
+            if packet.channel_type != "session":
+                connection.send(Msg92_ChannelOpenFailure(packet.sender, 1, "only session channels supported"))
                 continue
-            reader.end()
-            result = cls(connection, remote, window, max_packet)
-            connection.send(
-                Message(91)
-                .u32(remote)
-                .u32(0)
-                .u32(CHANNEL_WINDOW)
-                .u32(CHANNEL_PACKET)
-                .build()
-            )
+            result = cls(connection, packet.sender, packet.window, packet.max_packet)
+            connection.send(Msg91_ChannelOpenConfirmation(recipient=packet.sender))
             return result
 
-    def request(
-        self, name: str, data: bytes = b"", want_reply: bool = True
-    ) -> None:
+    def request(self, request: RequestBody, want_reply: bool = True) -> None:
         self.request_reply = None
-        self.connection.send(
-            Message(98)
-            .u32(self.remote)
-            .string(name)
-            .boolean(want_reply)
-            .raw(data)
-            .build()
-        )
+        self.connection.send(Msg98_ChannelRequest(self.remote, request, want_reply))
 
     def reply(self, success: bool) -> None:
-        self.connection.send(
-            Message(99 if success else 100).u32(self.remote).build()
-        )
+        response = Msg99_ChannelSuccess(self.remote) if success else Msg100_ChannelFailure(self.remote)
+        self.connection.send(response)
 
     def send_data(self, data: bytes, stream: int = 0) -> int:
         if self.sent_eof or self.sent_close or self.peer_closed:
             raise ProtocolError("data sent on a closed channel")
         count = min(len(data), self.send_window, self.max_packet)
         if count:
-            message = Message(95 if stream else 94).u32(self.remote)
             if stream:
-                message.u32(stream)
-            self.connection.send(message.string(data[:count]).build())
+                packet: SshPacket = Msg95_ChannelExtendedData(self.remote, stream, data[:count])
+            else:
+                packet = Msg94_ChannelData(self.remote, data[:count])
+            self.connection.send(packet)
             self.send_window -= count
         return count
 
@@ -1432,97 +1784,59 @@ class Channel:
         if count < 0 or self.recv_window + count > CHANNEL_WINDOW:
             raise ProtocolError("invalid channel receive-window replenishment")
         if count and not self.sent_close:
-            self.connection.send(
-                Message(93).u32(self.remote).u32(count).build()
-            )
+            self.connection.send(Msg93_ChannelWindowAdjust(self.remote, count))
             self.recv_window += count
 
     def eof(self) -> None:
         if not self.sent_eof and not self.sent_close:
-            self.connection.send(Message(96).u32(self.remote).build())
+            self.connection.send(Msg96_ChannelEOF(self.remote))
             self.sent_eof = True
 
     def close(self) -> None:
         if not self.sent_close:
-            self.connection.send(Message(97).u32(self.remote).build())
+            self.connection.send(Msg97_ChannelClose(self.remote))
             self.sent_close = True
 
-    def _extra_open(self, packet: SshPacket) -> None:
-        reader = MessageReader(packet)
-        reader.text()
-        remote = reader.u32()
-        # Additional channel type-specific fields are opaque and rejected.
-        self.connection.send(
-            Message(92)
-            .u32(remote)
-            .u32(1)
-            .string("only one session per connection supported")
-            .string("")
-            .build()
-        )
-
-    def handle(self, packet: SshPacket) -> ChannelData | ChannelRequest | None:
+    def handle(self, packet: SshPacket) -> ChannelData | Msg98_ChannelRequest | None:
         if handle_global(self.connection, packet):
             return None
-        if packet.msgtype == 90:
-            self._extra_open(packet)
+        if isinstance(packet, Msg90_ChannelOpen):
+            self.connection.send(Msg92_ChannelOpenFailure(packet.sender, 1, "only one session per connection supported"))
             return None
-        reader = MessageReader(packet)
-        if packet.msgtype not in range(93, 101) or reader.u32() != 0:
+        if not isinstance(packet, ChannelMessage) or packet.msgtype not in range(93, 101) or packet.recipient != 0:
             raise ProtocolError(f"unexpected channel message {packet.msgtype}")
-        if packet.msgtype in (94, 95):
-            stream = reader.u32() if packet.msgtype == 95 else 0
-            data = reader.string()
-            reader.end()
-            if (
-                self.peer_eof
-                or self.peer_closed
-                or len(data) > self.recv_window
-                or len(data) > CHANNEL_PACKET
-            ):
-                raise ProtocolError(
-                    "channel data violates state/window/packet limit"
-                )
-            self.recv_window -= len(data)
-            return ChannelData(stream, data)
-        if packet.msgtype == 98:
-            name, want_reply = reader.text(), reader.boolean()
-            return ChannelRequest(
-                name, want_reply, reader.read(reader.remaining())
-            )
-        self._control(packet.msgtype, reader)
-        reader.end()
+        if isinstance(packet, (Msg94_ChannelData, Msg95_ChannelExtendedData)):
+            if self.peer_eof or self.peer_closed or len(packet.data) > self.recv_window or len(packet.data) > CHANNEL_PACKET:
+                raise ProtocolError("channel data violates state/window/packet limit")
+            self.recv_window -= len(packet.data)
+            stream = packet.stream if isinstance(packet, Msg95_ChannelExtendedData) else 0
+            return ChannelData(stream, packet.data)
+        if isinstance(packet, Msg98_ChannelRequest):
+            return packet
+        self._control(packet)
         return None
 
-    def _control(self, msgtype: int, reader: MessageReader) -> None:
-        if msgtype == 93:
-            adjustment = reader.u32()
-            if self.send_window + adjustment > 0xFFFFFFFF:
+    def _control(self, packet: SshPacket) -> None:
+        if isinstance(packet, Msg93_ChannelWindowAdjust):
+            if self.send_window + packet.adjustment > 0xFFFFFFFF:
                 raise ProtocolError("channel window overflow")
-            self.send_window += adjustment
-        elif msgtype == 96:
+            self.send_window += packet.adjustment
+        elif isinstance(packet, Msg96_ChannelEOF):
             self.peer_eof = True
-        elif msgtype == 97:
+        elif isinstance(packet, Msg97_ChannelClose):
             self.peer_closed = True
             self.close()
-        elif msgtype in (99, 100):
-            self.request_reply = msgtype == 99
+        elif isinstance(packet, (Msg99_ChannelSuccess, Msg100_ChannelFailure)):
+            self.request_reply = isinstance(packet, Msg99_ChannelSuccess)
 
-    def handle_client_request(self, request: ChannelRequest) -> None:
-        reader = request.reader()
-        if request.name == "exit-status":
-            self.exit_status = reader.read32be()
-            require_end(reader)
-        elif request.name == "exit-signal":
+    def handle_client_request(self, packet: Msg98_ChannelRequest) -> None:
+        request = packet.request
+        if isinstance(request, ExitStatusRequest):
+            self.exit_status = request.status
+        elif isinstance(request, ExitSignalRequest):
             self.exit_status = 255
-            # Explicitly consume signal, core flag, description, language.
-            readlstr(reader)
-            reader.readbyte()
-            readlstr(reader)
-            readlstr(reader)
-            require_end(reader)
-        if request.want_reply:
-            self.reply(request.name in ("exit-status", "exit-signal"))
+        if packet.want_reply:
+            self.reply(isinstance(request, (ExitStatusRequest, ExitSignalRequest)))
 
 
 @dataclass(frozen=True)
@@ -1533,13 +1847,7 @@ class CommandResult:
 
 
 class ClientSession:
-    def __init__(
-        self,
-        channel: Channel,
-        source: BinaryIO,
-        stdout: BinaryIO,
-        stderr: BinaryIO,
-    ):
+    def __init__(self, channel: Channel, source: BinaryIO, stdout: BinaryIO, stderr: BinaryIO):
         self.channel = channel
         self.source = source
         self.stdout = stdout
@@ -1550,12 +1858,8 @@ class ClientSession:
             self.input_fd = None
 
     def run(self, command: str | None) -> int:
-        body = (
-            Message(0).string(command).build().body
-            if command is not None
-            else b""
-        )
-        self.channel.request("exec" if command is not None else "shell", body)
+        request = ExecRequest(command) if command is not None else ShellRequest()
+        self.channel.request(request)
         while self.channel.request_reply is None:
             self._packet()
             if self.channel.peer_closed:
@@ -1571,37 +1875,23 @@ class ClientSession:
         can_input = not channel.sent_eof and channel.send_window > 0
         if can_input and self.input_fd is None:
             self._input()
-        readers: list[int | socket.socket] = [
-            channel.connection.transport.sock
-        ]
+        readers: list[int | socket.socket] = [channel.connection.transport.sock]
         if can_input and self.input_fd is not None:
             readers.append(self.input_fd)
-        immediate = (
-            can_input and self.input_fd is None and not channel.sent_eof
-        )
+        immediate = can_input and self.input_fd is None and not channel.sent_eof
         transport = channel.connection.transport
         writers = [transport.sock] if transport.outgoing else []
-        ready, writable, _ = select.select(
-            readers, writers, [], 0 if immediate else None
-        )
+        ready, writable, _ = select.select(readers, writers, [], 0 if immediate else None)
         if writable:
             transport.flush()
         if channel.connection.transport.sock in ready:
             self._packet()
-        if (
-            self.input_fd is not None
-            and self.input_fd in ready
-            and not channel.peer_closed
-        ):
+        if self.input_fd is not None and self.input_fd in ready and not channel.peer_closed:
             self._input()
 
     def _input(self) -> None:
         count = min(self.channel.send_window, self.channel.max_packet)
-        data = (
-            self.source.read(count)
-            if self.input_fd is None
-            else os.read(self.input_fd, count)
-        )
+        data = self.source.read(count) if self.input_fd is None else os.read(self.input_fd, count)
         if not data:
             self.channel.eof()
         else:
@@ -1622,52 +1912,29 @@ class ClientSession:
         event = channel.handle(channel.connection.receive())
         if isinstance(event, ChannelData):
             if event.stream not in (0, 1):
-                raise ProtocolError(
-                    f"unsupported extended-data stream: {event.stream}"
-                )
-            self._write(
-                self.stderr if event.stream else self.stdout, event.data
-            )
+                raise ProtocolError(f"unsupported extended-data stream: {event.stream}")
+            self._write(self.stderr if event.stream else self.stdout, event.data)
             channel.acknowledge(len(event.data))
-        elif isinstance(event, ChannelRequest):
+        elif isinstance(event, Msg98_ChannelRequest):
             channel.handle_client_request(event)
 
 
 class SSHClient:
-    def __init__(
-        self,
-        sock: socket.socket,
-        pinned_key: HostKey,
-        curve_only: bool = False,
-    ):
-        self.connection = Connection(
-            sock, pinned_key=pinned_key, curve_only=curve_only
-        )
+    def __init__(self, sock: socket.socket, pinned_key: HostKey | None = None, curve_only: bool = False):
+        self.connection = Connection(sock, pinned_key=pinned_key, curve_only=curve_only)
 
     def authenticate(self, username: str, password: str) -> None:
         client_authenticate(self.connection, Credentials(username, password))
 
-    def authenticate_publickey(
-        self, username: str, private_key: ed25519.Ed25519PrivateKey
-    ) -> None:
+    def authenticate_publickey(self, username: str, private_key: ed25519.Ed25519PrivateKey) -> None:
         client_publickey_authenticate(self.connection, username, private_key)
 
-    def run(
-        self, command: str | None, input_data: bytes = b""
-    ) -> CommandResult:
+    def run(self, command: str | None, input_data: bytes = b"") -> CommandResult:
         stdout, stderr = io.BytesIO(), io.BytesIO()
-        status = self.run_stream(
-            command, io.BytesIO(input_data), stdout, stderr
-        )
+        status = self.run_stream(command, io.BytesIO(input_data), stdout, stderr)
         return CommandResult(stdout.getvalue(), stderr.getvalue(), status)
 
-    def run_stream(
-        self,
-        command: str | None,
-        source: BinaryIO,
-        stdout: BinaryIO,
-        stderr: BinaryIO,
-    ) -> int:
+    def run_stream(self, command: str | None, source: BinaryIO, stdout: BinaryIO, stderr: BinaryIO) -> int:
         channel = Channel.open_client(self.connection)
         return ClientSession(channel, source, stdout, stderr).run(command)
 
@@ -1700,17 +1967,8 @@ class ServerSession:
     def _start(self, command: str | None) -> None:
         if command is not None and "\x00" in command:
             raise ProtocolError("NUL in exec command")
-        arguments = (
-            ["/bin/sh"] if command is None else ["/bin/sh", "-c", command]
-        )
-        process = subprocess.Popen(
-            arguments,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-            bufsize=0,
-        )
+        arguments = ["/bin/sh"] if command is None else ["/bin/sh", "-c", command]
+        process = subprocess.Popen(arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
         self.process = process
         assert process.stdin and process.stdout and process.stderr
         for stream in (process.stdin, process.stdout, process.stderr):
@@ -1718,38 +1976,29 @@ class ServerSession:
         self.outputs[process.stdout.fileno()] = (process.stdout, 0)
         self.outputs[process.stderr.fileno()] = (process.stderr, 1)
 
-    def _request(self, request: ChannelRequest) -> None:
+    def _request(self, packet: Msg98_ChannelRequest) -> None:
+        request = packet.request
         success = False
-        if request.name in ("exec", "shell") and self.process is None:
-            reader = request.reader()
-            command = readlstr(reader) if request.name == "exec" else None
-            require_end(reader)
+        if isinstance(request, (ExecRequest, ShellRequest)) and self.process is None:
+            command = request.command if isinstance(request, ExecRequest) else None
             try:
                 self._start(command)
                 success = True
             except OSError:
                 success = False
-        elif request.name == "signal" and self.process is not None:
-            reader = request.reader()
-            name = readlstr(reader)
-            require_end(reader)
-            allowed = {
-                "INT": signal.SIGINT,
-                "TERM": signal.SIGTERM,
-                "HUP": signal.SIGHUP,
-                "KILL": signal.SIGKILL,
-            }
-            if name in allowed and self.process.poll() is None:
-                os.killpg(self.process.pid, allowed[name])
+        elif isinstance(request, SignalRequest) and self.process is not None:
+            allowed = {"INT": signal.SIGINT, "TERM": signal.SIGTERM, "HUP": signal.SIGHUP, "KILL": signal.SIGKILL}
+            if request.signal in allowed and self.process.poll() is None:
+                os.killpg(self.process.pid, allowed[request.signal])
                 success = True
-        # Other request bodies (pty-req, env, subsystem, etc.) remain opaque
-        # and are explicitly rejected, never reported as successfully applied.
-        if request.want_reply:
+        # OpaqueRequest bodies (pty-req, env, subsystem, etc.) are retained
+        # and explicitly rejected, never reported as successfully applied.
+        if packet.want_reply:
             self.channel.reply(success)
 
     def _packet(self) -> None:
         event = self.channel.handle(self.channel.connection.receive())
-        if isinstance(event, ChannelRequest):
+        if isinstance(event, Msg98_ChannelRequest):
             self._request(event)
         elif isinstance(event, ChannelData):
             if self.process is None or event.stream != 0:
@@ -1783,9 +2032,7 @@ class ServerSession:
         channel = self.channel
         stream, kind = self.outputs[descriptor]
         try:
-            data = os.read(
-                descriptor, min(channel.send_window, channel.max_packet)
-            )
+            data = os.read(descriptor, min(channel.send_window, channel.max_packet))
         except BlockingIOError:
             return
         if not data:
@@ -1825,8 +2072,7 @@ class ServerSession:
         assert self.process is not None
         status = self.process.wait()
         status = status if status >= 0 else 128 - status
-        body = Message(0).u32(status & 0xFFFFFFFF).build().body
-        self.channel.request("exit-status", body, want_reply=False)
+        self.channel.request(ExitStatusRequest(status & 0xFFFFFFFF), want_reply=False)
         self.channel.eof()
         self.channel.close()
         # Complete channel close before tearing down TCP; avoid dropping the
@@ -1839,9 +2085,7 @@ class ServerSession:
                 break
             transport = self.channel.connection.transport
             writers = [network] if transport.outgoing else []
-            ready, writable, _ = select.select(
-                [network], writers, [], remaining
-            )
+            ready, writable, _ = select.select([network], writers, [], remaining)
             if writable:
                 transport.flush()
             if ready:
@@ -1861,11 +2105,7 @@ class ServerSession:
                 self.process.wait()
             except ProcessLookupError:
                 self.process.wait()
-        for stream in (
-            self.process.stdin,
-            self.process.stdout,
-            self.process.stderr,
-        ):
+        for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
             if stream is not None and not stream.closed:
                 stream.close()
 
@@ -1873,16 +2113,9 @@ class ServerSession:
 class SSHServer:
     """Configured login; commands run as the existing OS user."""
 
-    def __init__(
-        self,
-        host_key: ed25519.Ed25519PrivateKey,
-        credentials: Credentials,
-        curve_only: bool = False,
-    ):
+    def __init__(self, host_key: ed25519.Ed25519PrivateKey, credentials: Credentials, curve_only: bool = False):
         if not credentials.methods():
-            raise ValueError(
-                "server requires a password or an authorized user key"
-            )
+            raise ValueError("server requires a password or an authorized user key")
         self.host_key = host_key
         self.credentials = credentials
         self.curve_only = curve_only
@@ -1890,12 +2123,7 @@ class SSHServer:
     def serve(self, sock: socket.socket) -> None:
         connection: Connection | None = None
         try:
-            connection = Connection(
-                sock,
-                server=True,
-                host_key=self.host_key,
-                curve_only=self.curve_only,
-            )
+            connection = Connection(sock, server=True, host_key=self.host_key, curve_only=self.curve_only)
             server_authenticate(connection, self.credentials)
             ServerSession(Channel.open_server(connection)).run()
         finally:
@@ -1919,11 +2147,7 @@ def load_private_key(path: Path) -> ed25519.Ed25519PrivateKey:
 
 def generate_host_key(path: Path) -> None:
     key = ed25519.Ed25519PrivateKey.generate()
-    private = key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.OpenSSH,
-        serialization.NoEncryption(),
-    )
+    private = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH, serialization.NoEncryption())
     public = HostKey("ssh-ed25519", key.public_key().public_bytes_raw())
     with path.open("xb") as destination:
         os.chmod(path, 0o600)
@@ -1932,16 +2156,6 @@ def generate_host_key(path: Path) -> None:
     with public_path.open("xb") as destination:
         destination.write(public.openssh() + b"\n")
     print(public.fingerprint())
-
-
-def password_from_environment(name: str | None) -> str:
-    if name is not None:
-        if name not in os.environ:
-            raise ValueError(
-                f"password environment variable {name!r} is not set"
-            )
-        return os.environ[name]
-    return getpass.getpass("Password: ")
 
 
 def print_transcript(path: Path) -> None:
@@ -1959,22 +2173,20 @@ def print_transcript(path: Path) -> None:
             for name in value.packet.list_fields:
                 print(f"    {name}: {getattr(value.packet, name)}")
         elif isinstance(value.packet, Msg30_ECDHInit):
-            print(
-                f"{prefix} KEX_INIT public blob="
-                f"{len(value.packet.pubkey)} bytes"
-            )
+            print(f"{prefix} KEX_INIT public blob={len(value.packet.pubkey)} bytes")
         elif isinstance(value.packet, Msg31_ECDHReply):
             packet = value.packet
-            print(
-                f"{prefix} KEX_REPLY public blob={len(packet.pubkey)} bytes "
-                f"host={packet.hostkey.fingerprint()} "
-                f"signature={len(packet.signature.data)} bytes"
-            )
+            print(f"{prefix} KEX_REPLY public blob={len(packet.pubkey)} bytes host={packet.hostkey.fingerprint()} signature={len(packet.signature.data)} bytes")
         else:
-            print(
-                f"{prefix} type={value.packet.msgtype} "
-                f"length={value.packet_length}"
-            )
+            print(f"{prefix} type={value.packet.msgtype} length={value.packet_length}")
+
+
+def read_password(password: str | None) -> str:
+    if password is not None:
+        return password
+    if "SSH_PASSWORD" in os.environ:
+        return os.environ["SSH_PASSWORD"]
+    return getpass.getpass("Password: ")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1982,77 +2194,34 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="mode", required=True)
     keygen = commands.add_parser("keygen", help="generate an Ed25519 host key")
     keygen.add_argument("path", type=Path)
-    decode = commands.add_parser(
-        "decode", help="decode a direction-marked hex capture"
-    )
+    decode = commands.add_parser("decode", help="decode a direction-marked hex capture")
     decode.add_argument("path", type=Path)
-    server = commands.add_parser(
-        "server", help="authenticated non-PTY shell/exec"
-    )
-    client = commands.add_parser(
-        "client", help="connect and run a shell/command"
-    )
+    server = commands.add_parser("server", help="authenticated non-PTY shell/exec")
+    client = commands.add_parser("client", help="connect and run a shell/command")
     for endpoint in (server, client):
-        endpoint.add_argument("--port", type=int, default=2222)
-        endpoint.add_argument("--user", required=True)
-        endpoint.add_argument(
-            "--host-key",
-            type=Path,
-            required=True,
-            help="server: private key; client: pinned .pub file",
-        )
-        endpoint.add_argument(
-            "--password-env",
-            help="read password from this environment variable",
-        )
-        endpoint.add_argument(
-            "--curve25519", action="store_true", help="disable hybrid ML-KEM"
-        )
-        endpoint.add_argument(
-            "--timeout",
-            type=float,
-            default=30,
-            help="timeout for incomplete network reads, seconds",
-        )
-    server.add_argument(
-        "--authorized-key",
-        type=Path,
-        help="allow this Ed25519 user public key",
-    )
-    client.add_argument(
-        "--identity", type=Path, help="Ed25519 user private key"
-    )
-    server.add_argument("--listen", default="127.0.0.1")
-    server.add_argument("--once", action="store_true")
+        endpoint.add_argument("-p", "--port", type=int, default=22)
+        endpoint.add_argument("-u", "--user", required=True)
+        endpoint.add_argument("-k", "--host-key", type=Path, required=endpoint is server, help="server: private key; client: optional pinned .pub file")
+        endpoint.add_argument("-P", "--password", help="login password; otherwise use SSH_PASSWORD or prompt")
+        endpoint.add_argument("-c", "--curve25519", action="store_true", help="disable hybrid ML-KEM")
+        endpoint.add_argument("-t", "--timeout", type=float, default=30, help="timeout for incomplete network reads, seconds")
+    server.add_argument("-a", "--authorized-key", type=Path, help="allow this Ed25519 user public key")
+    server.add_argument("-l", "--listen", default="127.0.0.1")
+    server.add_argument("-o", "--once", action="store_true")
+    client.add_argument("-i", "--identity", type=Path, help="Ed25519 user private key")
     client.add_argument("host")
-    client.add_argument(
-        "command",
-        nargs=argparse.REMAINDER,
-        help="remote command; omit for a non-PTY shell",
-    )
+    client.add_argument("command", nargs=argparse.REMAINDER, help="remote command; omit for a non-PTY shell")
     return parser
 
 
 def run_server(args: argparse.Namespace) -> None:
-    authorized = (
-        ()
-        if args.authorized_key is None
-        else (HostKey.from_public_file(args.authorized_key),)
-    )
-    password = (
-        None
-        if authorized and args.password_env is None
-        else password_from_environment(args.password_env)
-    )
+    authorized = () if args.authorized_key is None else (HostKey.from_public_file(args.authorized_key),)
+    key_only = bool(authorized) and args.password is None and "SSH_PASSWORD" not in os.environ
+    password = None if key_only else read_password(args.password)
     credentials = Credentials(args.user, password, authorized)
-    server = SSHServer(
-        load_private_key(args.host_key), credentials, args.curve25519
-    )
+    server = SSHServer(load_private_key(args.host_key), credentials, args.curve25519)
     with socket.create_server((args.listen, args.port)) as listener:
-        print(
-            f"Listening on {args.listen}:{listener.getsockname()[1]}",
-            file=sys.stderr,
-        )
+        print(f"Listening on {args.listen}:{listener.getsockname()[1]}", file=sys.stderr)
         while True:
             peer, _ = listener.accept()
             peer.settimeout(args.timeout)
@@ -2065,27 +2234,17 @@ def run_server(args: argparse.Namespace) -> None:
 
 
 def run_client(args: argparse.Namespace) -> int:
-    pinned = HostKey.from_public_file(args.host_key)
-    password = (
-        None
-        if args.identity is not None
-        else password_from_environment(args.password_env)
-    )
-    with socket.create_connection(
-        (args.host, args.port), timeout=args.timeout
-    ) as sock:
+    pinned = HostKey.from_public_file(args.host_key) if args.host_key is not None else None
+    password = None if args.identity is not None else read_password(args.password)
+    with socket.create_connection((args.host, args.port), timeout=args.timeout) as sock:
         client = SSHClient(sock, pinned, args.curve25519)
         if args.identity is not None:
-            client.authenticate_publickey(
-                args.user, load_private_key(args.identity)
-            )
+            client.authenticate_publickey(args.user, load_private_key(args.identity))
         else:
             assert password is not None
             client.authenticate(args.user, password)
         command = " ".join(args.command) if args.command else None
-        return client.run_stream(
-            command, sys.stdin.buffer, sys.stdout.buffer, sys.stderr.buffer
-        )
+        return client.run_stream(command, sys.stdin.buffer, sys.stdout.buffer, sys.stderr.buffer)
 
 
 def main() -> int:
