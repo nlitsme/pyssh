@@ -142,6 +142,7 @@ a mismatch fails before user authentication.
 
 | Option | Short form | Default/meaning |
 | --- | --- | --- |
+| `--verbose` | `-v` / `-vv` | Full message hex / decoded fields, to stderr |
 | `--port` | `-p` | 22 |
 | `--user` | `-u` | Required SSH username |
 | `--password` | `-P` | Otherwise `SSH_PASSWORD`, then prompt |
@@ -159,6 +160,47 @@ An OpenSSH client can connect too:
 ssh -T -o PreferredAuthentications=password \
     -o PubkeyAuthentication=no testuser@127.0.0.1 'printf hello'
 ```
+
+## Protocol tracing
+
+Use `-v` or `--verbose` on either endpoint for a complete single-line hex
+record for every sent and received SSH message:
+
+```sh
+python ssh.py client -v -u testuser 127.0.0.1 'uname -a'
+python ssh.py server -v -k host_ed25519 -u testuser
+```
+
+For example:
+
+```text
+send SSH_MSG_SERVICE_REQUEST 050000000c7373682d7573657261757468
+```
+
+The hex is the message-type byte followed by the entire body. It is not
+truncated or wrapped, and excludes transport length fields, padding, and
+authentication tags. Outgoing messages are logged before encryption;
+incoming messages after decryption, integrity verification, and decoding.
+Identification/pre-banner lines are also logged, with their complete bytes.
+Direction is relative to the endpoint producing the log.
+
+Use `-vv` (or repeat `--verbose`) for the decoded representation instead:
+
+```text
+send SSH_MSG_SERVICE_REQUEST (type=5, 17 bytes)
+  service: 'ssh-userauth'
+```
+
+Nested authentication and request structures retain named fields. Algorithm
+lists are shown one entry per line; binary values include lengths and full
+offset-labelled hex dumps, plus text where readable. Control characters in
+text are escaped. Hybrid key-exchange messages are named according to the
+negotiated algorithm. `-vvv` and higher use the same decoded format as `-vv`.
+
+Tracing goes to stderr, leaving command stdout unchanged. This is a full
+plaintext trace: passwords and channel contents are included. The default
+verbosity is zero. Library users can pass `verbose=1` or `verbose=2`, and an
+optional text `trace_stream`, to `SSHClient`, `SSHServer`, or `Connection`.
 
 ## Ed25519 user authentication
 
@@ -196,7 +238,7 @@ python -m unittest discover -s tests -v
 python -m unittest datareader datawriter -v
 ```
 
-Validated here: **34 SSH tests plus 18 original helper tests**, all passing.
+Validated here: **41 SSH tests plus 18 original helper tests**, all passing.
 OpenSSH 10.0p2 independently verified both endpoints with both KEX methods;
 rekeys during live transfers and after authentication were also tested.
 OpenSSH-specific tests skip only when the relevant executable is absent.

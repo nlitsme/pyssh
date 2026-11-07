@@ -24,9 +24,9 @@ import threading
 import time
 import warnings
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
-from typing import IO, BinaryIO, ClassVar, TypeVar
+from typing import IO, BinaryIO, ClassVar, Iterator, TextIO, TypeVar
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -1183,6 +1183,123 @@ def decode_transcript(text: str) -> tuple[TranscriptEvent, ...]:
     return tuple(result)
 
 
+MESSAGE_NAMES: dict[int, str] = {
+    1: "SSH_MSG_DISCONNECT",
+    2: "SSH_MSG_IGNORE",
+    3: "SSH_MSG_UNIMPLEMENTED",
+    4: "SSH_MSG_DEBUG",
+    5: "SSH_MSG_SERVICE_REQUEST",
+    6: "SSH_MSG_SERVICE_ACCEPT",
+    20: "SSH_MSG_KEXINIT",
+    21: "SSH_MSG_NEWKEYS",
+    30: "SSH_MSG_KEX_ECDH_INIT",
+    31: "SSH_MSG_KEX_ECDH_REPLY",
+    50: "SSH_MSG_USERAUTH_REQUEST",
+    51: "SSH_MSG_USERAUTH_FAILURE",
+    52: "SSH_MSG_USERAUTH_SUCCESS",
+    53: "SSH_MSG_USERAUTH_BANNER",
+    60: "SSH_MSG_USERAUTH_PK_OK",
+    80: "SSH_MSG_GLOBAL_REQUEST",
+    81: "SSH_MSG_REQUEST_SUCCESS",
+    82: "SSH_MSG_REQUEST_FAILURE",
+    90: "SSH_MSG_CHANNEL_OPEN",
+    91: "SSH_MSG_CHANNEL_OPEN_CONFIRMATION",
+    92: "SSH_MSG_CHANNEL_OPEN_FAILURE",
+    93: "SSH_MSG_CHANNEL_WINDOW_ADJUST",
+    94: "SSH_MSG_CHANNEL_DATA",
+    95: "SSH_MSG_CHANNEL_EXTENDED_DATA",
+    96: "SSH_MSG_CHANNEL_EOF",
+    97: "SSH_MSG_CHANNEL_CLOSE",
+    98: "SSH_MSG_CHANNEL_REQUEST",
+    99: "SSH_MSG_CHANNEL_SUCCESS",
+    100: "SSH_MSG_CHANNEL_FAILURE",
+}
+
+
+class ProtocolTrace:
+    """Plaintext message tracing, after verification on receive and before encryption on send.
+
+    Level 1 emits complete message hex, including its type byte, on one line.
+    Level 2 emits decoded fields, including passwords and channel data.
+    """
+
+    def __init__(self, verbose: int = 0, stream: TextIO | None = None):
+        self.verbose = verbose
+        self.stream = stream if stream is not None else sys.stderr
+        self.kex_algorithm = ""
+        self.lock = threading.Lock()
+
+    def name(self, packet: SshPacket) -> str:
+        if self.kex_algorithm == KEX_HYBRID and packet.msgtype in (30, 31):
+            return "SSH_MSG_KEX_HYBRID_INIT" if packet.msgtype == 30 else "SSH_MSG_KEX_HYBRID_REPLY"
+        return MESSAGE_NAMES.get(packet.msgtype, f"SSH_MSG_UNKNOWN_{packet.msgtype}")
+
+    def message(self, direction: str, packet: SshPacket, payload: bytes) -> None:
+        if not self.verbose:
+            return
+        prefix = f"{direction} {self.name(packet)}"
+        if self.verbose == 1:
+            self._write(f"{prefix} {payload.hex()}\n")
+        else:
+            lines = [f"{prefix} (type={packet.msgtype}, {len(payload)} bytes)"]
+            lines.extend(self._fields(packet, "  "))
+            self._write("\n".join(lines) + "\n")
+
+    def identification(self, direction: str, value: Hello | Banner) -> None:
+        if not self.verbose:
+            return
+        name = "SSH_IDENTIFICATION" if isinstance(value, Hello) else "SSH_PRE_BANNER"
+        data = encode_object(value)
+        detail = data.hex() if self.verbose == 1 else repr(data.decode("utf-8", errors="backslashreplace"))
+        self._write(f"{direction} {name} {detail}\n")
+
+    def _write(self, text: str) -> None:
+        with self.lock:
+            self.stream.write(text)
+            self.stream.flush()
+
+    def _fields(self, value: WireObject, indent: str) -> Iterator[str]:
+        if not is_dataclass(value):
+            yield f"{indent}(empty body)"
+            return
+        for item in fields(value):
+            field_value: object = getattr(value, item.name)
+            if isinstance(value, Msg20_KexInit) and item.name in value.list_fields:
+                yield f"{indent}{item.name}:"
+                names = str(field_value).split(",") if field_value else ()
+                for name in names:
+                    yield f"{indent}  {name}"
+                if not names:
+                    yield f"{indent}  (empty)"
+            else:
+                yield from self._field(item.name, field_value, indent)
+
+    def _field(self, name: str, value: object, indent: str) -> Iterator[str]:
+        if isinstance(value, WireObject):
+            kind = type(value).__name__
+            if isinstance(value, (AuthMethod, RequestBody)):
+                kind += f" ({value.name})"
+            yield f"{indent}{name}: {kind}"
+            yield from self._fields(value, indent + "  ")
+        elif isinstance(value, bytes):
+            yield f"{indent}{name}: {len(value)} bytes"
+            yield from self._bytes(value, indent + "  ")
+        else:
+            detail = f"{value} (0x{value:x})" if isinstance(value, int) and not isinstance(value, bool) else repr(value)
+            yield f"{indent}{name}: {detail}"
+
+    @staticmethod
+    def _bytes(data: bytes, indent: str) -> Iterator[str]:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = ""
+        if text and all(character.isprintable() or character in "\r\n\t" for character in text):
+            yield f"{indent}text: {text!r}"
+        for offset in range(0, len(data), 32):
+            yield f"{indent}{offset:04x}: {data[offset : offset + 32].hex(' ')}"
+
+
 class ChaChaPoly:
     """OpenSSH's construction, NOT the RFC 8439 ChaCha20Poly1305 API."""
 
@@ -1236,8 +1353,9 @@ class ChaChaPoly:
 class Transport:
     """TCP stream framing with independent send/receive protection state."""
 
-    def __init__(self, sock: socket.socket):
+    def __init__(self, sock: socket.socket, trace: ProtocolTrace | None = None):
         self.sock = sock
+        self.trace = trace if trace is not None else ProtocolTrace()
         self.send_cipher: ChaChaPoly | None = None
         self.recv_cipher: ChaChaPoly | None = None
         self.send_sequence = 0
@@ -1267,6 +1385,7 @@ class Transport:
     def exchange_hello(self, server: bool) -> tuple[Hello, Hello]:
         local = Hello()
         self.sock.sendall(encode_object(local))
+        self.trace.identification("send", local)
         for _ in range(50):
             line = bytearray()
             while not line.endswith(b"\n"):
@@ -1274,9 +1393,12 @@ class Transport:
                 if len(line) > 255:
                     raise ProtocolError("identification/pre-banner line too long")
             if line.startswith(b"SSH-"):
-                return local, decode_object(Hello(), bytes(line))
+                remote = decode_object(Hello(), bytes(line))
+                self.trace.identification("recv", remote)
+                return local, remote
             if server:
                 raise ProtocolError("client pre-identification text is forbidden")
+            self.trace.identification("recv", Banner(bytes(line)))
             # Server pre-banner lines are intentionally excluded from KEX.
         raise ProtocolError("too many server pre-identification lines")
 
@@ -1292,6 +1414,7 @@ class Transport:
             else:
                 data = self.send_cipher.seal(self.send_sequence, payload)
             self.outgoing.extend(data)
+            self.trace.message("send", packet, payload)
             self.flush()
             self.send_sequence += 1
             self.sent_bytes += len(data)
@@ -1322,6 +1445,7 @@ class Transport:
         frame = decode_object(SSH2Frame(), header + tail) if cipher is None else cipher.open(self.recv_sequence, header + tail)
         self.recv_sequence += 1
         self.received_bytes += 4 + len(tail)
+        self.trace.message("recv", frame.packet, encode_message(frame.packet))
         return frame.packet
 
 
@@ -1420,8 +1544,10 @@ class Connection:
         host_key: ed25519.Ed25519PrivateKey | None = None,
         pinned_key: HostKey | None = None,
         curve_only: bool = False,
+        verbose: int = 0,
+        trace_stream: TextIO | None = None,
     ):
-        self.transport = Transport(sock)
+        self.transport = Transport(sock, ProtocolTrace(verbose, trace_stream))
         self.server = server
         self.host_key = host_key
         self.pinned_key = pinned_key
@@ -1466,6 +1592,7 @@ class Connection:
             # Strict KEX is negotiated once; OpenSSH omits its marker on rekey.
             self.suite = replace(self.suite, strict=True)
         self.suite.require_supported()
+        self.transport.trace.kex_algorithm = self.suite.kex
         if not self.session_id and self.suite.strict:
             if self.transport.recv_sequence != 1:
                 raise ProtocolError("strict KEX requires KEXINIT as first packet")
@@ -1920,8 +2047,8 @@ class ClientSession:
 
 
 class SSHClient:
-    def __init__(self, sock: socket.socket, pinned_key: HostKey | None = None, curve_only: bool = False):
-        self.connection = Connection(sock, pinned_key=pinned_key, curve_only=curve_only)
+    def __init__(self, sock: socket.socket, pinned_key: HostKey | None = None, curve_only: bool = False, verbose: int = 0, trace_stream: TextIO | None = None):
+        self.connection = Connection(sock, pinned_key=pinned_key, curve_only=curve_only, verbose=verbose, trace_stream=trace_stream)
 
     def authenticate(self, username: str, password: str) -> None:
         client_authenticate(self.connection, Credentials(username, password))
@@ -2113,17 +2240,21 @@ class ServerSession:
 class SSHServer:
     """Configured login; commands run as the existing OS user."""
 
-    def __init__(self, host_key: ed25519.Ed25519PrivateKey, credentials: Credentials, curve_only: bool = False):
+    def __init__(
+        self, host_key: ed25519.Ed25519PrivateKey, credentials: Credentials, curve_only: bool = False, verbose: int = 0, trace_stream: TextIO | None = None
+    ):
         if not credentials.methods():
             raise ValueError("server requires a password or an authorized user key")
         self.host_key = host_key
         self.credentials = credentials
         self.curve_only = curve_only
+        self.verbose = verbose
+        self.trace_stream = trace_stream
 
     def serve(self, sock: socket.socket) -> None:
         connection: Connection | None = None
         try:
-            connection = Connection(sock, server=True, host_key=self.host_key, curve_only=self.curve_only)
+            connection = Connection(sock, server=True, host_key=self.host_key, curve_only=self.curve_only, verbose=self.verbose, trace_stream=self.trace_stream)
             server_authenticate(connection, self.credentials)
             ServerSession(Channel.open_server(connection)).run()
         finally:
@@ -2199,6 +2330,7 @@ def build_parser() -> argparse.ArgumentParser:
     server = commands.add_parser("server", help="authenticated non-PTY shell/exec")
     client = commands.add_parser("client", help="connect and run a shell/command")
     for endpoint in (server, client):
+        endpoint.add_argument("-v", "--verbose", action="count", default=0, help="trace message hex; repeat for decoded fields")
         endpoint.add_argument("-p", "--port", type=int, default=22)
         endpoint.add_argument("-u", "--user", required=True)
         endpoint.add_argument("-k", "--host-key", type=Path, required=endpoint is server, help="server: private key; client: optional pinned .pub file")
@@ -2219,7 +2351,7 @@ def run_server(args: argparse.Namespace) -> None:
     key_only = bool(authorized) and args.password is None and "SSH_PASSWORD" not in os.environ
     password = None if key_only else read_password(args.password)
     credentials = Credentials(args.user, password, authorized)
-    server = SSHServer(load_private_key(args.host_key), credentials, args.curve25519)
+    server = SSHServer(load_private_key(args.host_key), credentials, args.curve25519, verbose=args.verbose)
     with socket.create_server((args.listen, args.port)) as listener:
         print(f"Listening on {args.listen}:{listener.getsockname()[1]}", file=sys.stderr)
         while True:
@@ -2237,7 +2369,7 @@ def run_client(args: argparse.Namespace) -> int:
     pinned = HostKey.from_public_file(args.host_key) if args.host_key is not None else None
     password = None if args.identity is not None else read_password(args.password)
     with socket.create_connection((args.host, args.port), timeout=args.timeout) as sock:
-        client = SSHClient(sock, pinned, args.curve25519)
+        client = SSHClient(sock, pinned, args.curve25519, verbose=args.verbose)
         if args.identity is not None:
             client.authenticate_publickey(args.user, load_private_key(args.identity))
         else:
